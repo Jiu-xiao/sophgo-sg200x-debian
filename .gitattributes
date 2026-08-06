@@ -1,2 +1,3 @@
 components/sg2002-ipc/ports/osdrv/patches/*.patch -whitespace
 configs/**/patches/**/*.patch -whitespace
+components/sc035hgs-raw-tools/ports/duo-sdk/patches/*.patch -whitespace

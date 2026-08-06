@@ -1,0 +1,229 @@
+#!/bin/sh
+# Run one RAW operation and restore the accepted camera runtime afterwards.
+set -eu
+
+camera_service=maixcam-network-camera.service
+capture_service=maixcam-raw-camera.service
+camera_binary=/mnt/system/usr/bin/test_mmf
+sensor_config=/mnt/data/sensor_cfg.ini
+remoteproc_state=/sys/class/remoteproc/remoteproc0/state
+tool_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+capture_camera=$tool_dir/sc035hgs-test_mmf-raw
+replay_binary=$tool_dir/sc035hgs-raw-replay
+
+usage()
+{
+	cat <<'EOF'
+Usage:
+  sc035hgs-raw-session capture EMPTY_OUTPUT_DIR
+  sc035hgs-raw-session replay SCRIPT_FILE
+EOF
+}
+
+fail()
+{
+	printf 'sc035hgs-raw-session: %s\n' "$*" >&2
+	exit 2
+}
+
+validate_path()
+{
+	case $1 in
+		/*) ;;
+		*) fail "path must be absolute: $1" ;;
+	esac
+	[ "${#1}" -lt 400 ] || fail "path must be shorter than 400 bytes: $1"
+}
+
+validate_capture_path()
+{
+	validate_path "$1"
+	case $1 in
+		/mnt/data/raw|/mnt/data/raw/*) ;;
+		*) fail "capture path must be under /mnt/data/raw: $1" ;;
+	esac
+}
+
+validate_replay_script()
+{
+	validate_path "$1"
+	[ -f "$1" ] || fail "replay script is not a regular file: $1"
+	awk '
+		/^[[:space:]]*test_(dir|pq_bin|output_dir|sensor_cfg)[[:space:]]*=/ {
+			value = $0
+			sub(/^[^=]*=[[:space:]]*/, "", value)
+			sub(/[[:space:]\r]*$/, "", value)
+			if (substr(value, 1, 1) != "/" || length(value) >= 400) {
+				printf "invalid replay path: %s\n", value > "/dev/stderr"
+				exit 1
+			}
+			if ($0 ~ /^[[:space:]]*test_sensor_cfg[[:space:]]*=/ &&
+			    value == "/mnt/data/sensor_cfg.ini") {
+				printf "test_sensor_cfg must differ from active /mnt/data/sensor_cfg.ini\n" > "/dev/stderr"
+				exit 1
+			}
+		}
+	' "$1" || fail "replay script contains an invalid or unsafe path"
+}
+
+if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then
+	usage
+	exit 0
+fi
+[ "$#" -ge 1 ] || { usage >&2; exit 2; }
+operation=$1
+shift
+
+case $operation in
+	capture)
+		[ "$#" -eq 1 ] || { usage >&2; exit 2; }
+		validate_capture_path "$1"
+		operation_binary=$capture_camera
+		;;
+	replay)
+		[ "$#" -eq 1 ] || { usage >&2; exit 2; }
+		validate_replay_script "$1"
+		operation_binary=$replay_binary
+		;;
+	*)
+		usage >&2
+		exit 2
+		;;
+esac
+
+[ "$(id -u)" -eq 0 ] || fail "root privileges are required"
+[ -x "$operation_binary" ] || fail "tool is missing: $operation_binary"
+[ -f "$sensor_config" ] || fail "sensor configuration is missing"
+grep -q '^[[:space:]]*name[[:space:]]*=[[:space:]]*SMS_SC035HGS_' \
+	"$sensor_config" || fail "active sensor is not SC035HGS"
+systemctl is-active --quiet "$camera_service" || fail "camera service is not active"
+[ "$(pgrep -x test_mmf | wc -l)" -eq 1 ] || fail "expected exactly one test_mmf process"
+
+restore_camera()
+{
+	operation_status=$?
+	restore_status=0
+	trap - EXIT HUP INT TERM
+	set +e
+
+	timeout 20 systemctl stop "$capture_service" >/dev/null 2>&1
+	timeout 20 systemctl stop "$camera_service" >/dev/null 2>&1
+	# The media kernel releases VB/VI resources asynchronously after process exit.
+	sleep 2
+	unit_load_state=$(systemctl show "$camera_service" -p LoadState --value 2>/dev/null)
+	if [ "$unit_load_state" = not-found ] || [ -z "$unit_load_state" ]; then
+		systemd-run --unit=maixcam-network-camera \
+			--property=Type=simple \
+			--property=Restart=on-failure \
+			--property=RestartSec=1s \
+			"$camera_binary" 10 >/dev/null || restore_status=1
+	else
+		timeout 20 systemctl restart "$camera_service" || restore_status=1
+	fi
+	ready=0
+	attempt=0
+	while [ "$attempt" -lt 20 ]; do
+		if systemctl is-active --quiet "$camera_service" &&
+		   [ -S /run/maixcam-isp.sock ] &&
+		   ss -ltn | grep -q ':8554 '; then
+			pid_before=$(systemctl show "$camera_service" -p MainPID --value)
+			sleep 3
+			pid_after=$(systemctl show "$camera_service" -p MainPID --value)
+			if [ "$pid_before" = "$pid_after" ] && [ "$pid_after" -gt 0 ] &&
+			   systemctl is-active --quiet "$camera_service" &&
+			   [ -S /run/maixcam-isp.sock ]; then
+				ready=1
+				break
+			fi
+		fi
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	[ "$ready" -eq 1 ] || restore_status=1
+	[ "$(pgrep -x test_mmf | wc -l)" -eq 1 ] || restore_status=1
+
+	if [ "$ready" -eq 1 ]; then
+		"$camera_binary" --ispctl auto >/dev/null || restore_status=1
+		"$camera_binary" --ispctl noise save >/dev/null || restore_status=1
+		"$camera_binary" --ispctl noise set tnr 0 24 >/dev/null || restore_status=1
+		i2ctransfer -f -y 4 w3@0x30 0x45 0x01 0xc4 >/dev/null || restore_status=1
+	fi
+
+	if [ ! -r "$remoteproc_state" ] || [ "$(cat "$remoteproc_state")" != running ]; then
+		rtos-mode remoteproc >/dev/null || restore_status=1
+	fi
+	[ "$(systemctl is-system-running)" = running ] || restore_status=1
+	[ -z "$(systemctl --failed --no-legend --plain)" ] || restore_status=1
+	[ "$(cat "$remoteproc_state" 2>/dev/null)" = running ] || restore_status=1
+	[ "$(i2ctransfer -f -y 4 w2@0x30 0x45 0x01 r1 2>/dev/null)" = 0xc4 ] || restore_status=1
+	isp_state=$("$camera_binary" --ispctl get 2>/dev/null)
+	case $isp_state in 'OK mode=auto '*) ;; *) restore_status=1 ;; esac
+	noise_state=$("$camera_binary" --ispctl noise get 2>/dev/null)
+	case $noise_state in *'tnr enable=1 op=0 manual=16 auto=24,'*) ;; *) restore_status=1 ;; esac
+	rtos-cmd ping 0x13579bdf >/dev/null || restore_status=1
+
+	if [ "$restore_status" -eq 0 ]; then
+		printf 'RESTORE_STATUS=PASS\n'
+	else
+		printf 'RESTORE_STATUS=FAIL\n' >&2
+	fi
+	if [ "$operation_status" -ne 0 ]; then
+		exit "$operation_status"
+	fi
+	exit "$restore_status"
+}
+
+trap restore_camera EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+timeout 20 systemctl stop "$camera_service"
+attempt=0
+while pgrep -x test_mmf >/dev/null 2>&1; do
+	[ "$attempt" -lt 20 ] || fail "test_mmf did not stop"
+	attempt=$((attempt + 1))
+	sleep 1
+done
+sleep 2
+
+if [ "$operation" = capture ]; then
+	mkdir -p "$1"
+	systemd-run --unit=maixcam-raw-camera \
+		--property=Type=simple \
+		--property=Restart=no \
+		"$capture_camera" 10 >/dev/null
+	ready=0
+	attempt=0
+	while [ "$attempt" -lt 20 ]; do
+		if systemctl is-active --quiet "$capture_service" &&
+		   [ -S /run/maixcam-isp.sock ] &&
+		   ss -ltn | grep -q ':8554 '; then
+			pid_before=$(systemctl show "$capture_service" -p MainPID --value)
+			sleep 3
+			pid_after=$(systemctl show "$capture_service" -p MainPID --value)
+			if [ "$pid_before" = "$pid_after" ] && [ "$pid_after" -gt 0 ] &&
+			   systemctl is-active --quiet "$capture_service"; then
+				ready=1
+				break
+			fi
+		fi
+		attempt=$((attempt + 1))
+		sleep 1
+	done
+	[ "$ready" -eq 1 ] || fail "development camera did not become ready"
+	"$capture_camera" --ispctl manual 10000 100 >/dev/null
+	"$capture_camera" --ispctl gains 1024 1024 1024 >/dev/null
+	sleep 1
+	isp_state=$("$capture_camera" --ispctl get)
+	case $isp_state in
+		'OK mode=manual gain_mode=gain exptime_us=10000 iso=100 again=1024 dgain=1024 ispdgain=1024') ;;
+		*) fail "fixed exposure did not settle: $isp_state" ;;
+	esac
+	"$capture_camera" --ispctl raw capture "$1"
+	operation_status=0
+	true
+	# The EXIT trap stops this development camera and restores the product service.
+	exit "$operation_status"
+fi
+timeout 90 "$operation_binary" "$@"

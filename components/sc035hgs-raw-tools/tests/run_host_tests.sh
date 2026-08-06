@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Check component structure and shell contracts without the vendor SDK.
+set -euo pipefail
+
+component_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+build_script=$component_root/ports/duo-sdk/build.sh
+session_tool=$component_root/tools/sc035hgs-raw-session
+replay_patch=$component_root/ports/duo-sdk/patches/0003-enforce-raw-replay-input-contract.patch
+platform_patch=$component_root/ports/duo-sdk/patches/0004-use-offline-replay-platform.patch
+observation_patch=$component_root/ports/duo-sdk/patches/0005-bound-replay-observation-and-exit.patch
+platform_source=$component_root/src/replay_platform.c
+tmp_replay_script=$(mktemp)
+trap 'rm -f "$tmp_replay_script"' EXIT
+
+bash -n "$build_script"
+sh -n "$session_tool"
+"$session_tool" --help >/dev/null
+
+if "$session_tool" capture relative/path >/dev/null 2>&1; then
+	echo "session wrapper accepted a relative capture path" >&2
+	exit 1
+fi
+if "$session_tool" capture /tmp/raw >/dev/null 2>&1; then
+	echo "session wrapper accepted a capture path outside /mnt/data/raw" >&2
+	exit 1
+fi
+if "$session_tool" replay relative/script >/dev/null 2>&1; then
+	echo "session wrapper accepted a relative replay path" >&2
+	exit 1
+fi
+printf 'test_sensor_cfg = /mnt/data/sensor_cfg.ini\n' >"$tmp_replay_script"
+if unsafe_output=$("$session_tool" replay "$tmp_replay_script" 2>&1); then
+	echo "session wrapper accepted the active sensor config as its own copy source" >&2
+	exit 1
+fi
+grep -Fq 'test_sensor_cfg must differ from active /mnt/data/sensor_cfg.ini' \
+	<<<"$unsafe_output"
+grep -Fq 'cvi_raw_dump(isp_pipe, &dump_info)' \
+	"$component_root/src/test_mmf/raw_capture.c"
+grep -Fq 'require_empty_directory(resolved)' \
+	"$component_root/src/test_mmf/raw_capture.c"
+grep -Fq '0002-add-in-process-raw-capture.patch' "$build_script"
+grep -Fq '0003-enforce-raw-replay-input-contract.patch' "$build_script"
+grep -Fq '0004-use-offline-replay-platform.patch' "$build_script"
+grep -Fq '0005-bound-replay-observation-and-exit.patch' "$build_script"
+grep -Fq 'make -C "$raw_replay_lib_dir"' "$build_script"
+grep -Fq '"$middleware_work/lib/libraw_replay.a"' "$build_script"
+grep -Fq 'sc035hgs-raw-replay.contract.txt' "$build_script"
+grep -Fq 'sc035hgs_replay_platform_init(&stInputSize,' "$platform_patch"
+grep -Fq 'stVpssGrpAttr.u8VpssDev = 1' "$platform_patch"
+grep -Fq 'INCS += -I$(ISP_COMMON_PATH)/raw_replay' "$platform_patch"
+grep -Fq 'INCS += -I$(SDIR)' "$platform_patch"
+grep -Fq 'CVI_VI_SetDevTimingAttr(REPLAY_VI_DEV, &timing_attr)' \
+	"$platform_source"
+grep -Fq 'select_user_fe_source("for USER_FE geometry priming")' \
+	"$platform_source"
+grep -Fq 'CVI_VI_SendPipeRaw(1, pipes, frames, 0)' "$platform_source"
+grep -Fq 'ret != CVI_ERR_VI_FAILED_NOT_ENABLED' "$platform_source"
+grep -Fq 'USER_FE geometry primed %ux%u bayer=%d wdr=%d, expected ret=%#x' \
+	"$platform_source"
+if grep -Fq 'if (ret == CVI_SUCCESS)' "$platform_source"; then
+	echo "geometry prime accepts an unverified zero-address return" >&2
+	exit 1
+fi
+grep -Fq 'configure_user_fe_source("before VI device enable")' \
+	"$platform_source"
+grep -Fq 'configure_user_fe_source("after VI pipe creation")' \
+	"$platform_source"
+prime_source_line=$(grep -n 'select_user_fe_source("for USER_FE geometry priming")' \
+	"$platform_source" | cut -d: -f1)
+timing_line=$(grep -n 'ret = configure_replay_timing()' \
+	"$platform_source" | cut -d: -f1)
+prime_send_line=$(grep -n 'ret = prime_user_fe_geometry()' "$platform_source" | cut -d: -f1)
+set_attr_line=$(grep -n 'CVI_VI_SetDevAttr(REPLAY_VI_DEV' "$platform_source" | cut -d: -f1)
+pre_enable_line=$(grep -n 'configure_user_fe_source("before VI device enable")' \
+	"$platform_source" | cut -d: -f1)
+enable_dev_line=$(grep -n 'CVI_VI_EnableDev(REPLAY_VI_DEV)' "$platform_source" | cut -d: -f1)
+create_pipe_line=$(grep -n 'CVI_VI_CreatePipe(REPLAY_VI_PIPE' "$platform_source" | cut -d: -f1)
+post_create_line=$(grep -n 'configure_user_fe_source("after VI pipe creation")' \
+	"$platform_source" | cut -d: -f1)
+start_pipe_line=$(grep -n 'CVI_VI_StartPipe(REPLAY_VI_PIPE)' "$platform_source" | cut -d: -f1)
+test "$prime_source_line" -lt "$timing_line"
+test "$timing_line" -lt "$prime_send_line"
+test "$prime_send_line" -lt "$set_attr_line"
+test "$set_attr_line" -lt "$pre_enable_line"
+test "$pre_enable_line" -lt "$enable_dev_line"
+test "$create_pipe_line" -lt "$post_create_line"
+test "$post_create_line" -lt "$start_pipe_line"
+grep -Fq 'VPSS_MODE_DUAL' "$platform_source"
+grep -Fq 'VPSS_INPUT_MEM' "$platform_source"
+grep -Fq 'VPSS_INPUT_ISP' "$platform_source"
+grep -Fq 'SAMPLE_COMM_ISP_Aelib_Callback' "$platform_source"
+grep -Fq 'SAMPLE_COMM_ISP_Awblib_Callback' "$platform_source"
+grep -Fq 'SAMPLE_COMM_ISP_Run' "$platform_source"
+grep -Fq 'sc035hgs_replay_platform_deinit' "$platform_source"
+if grep -Eq 'SAMPLE_COMM_VI_(StartSensor|StartMIPI|SensorProbe|CreateIsp)' \
+	"$platform_source"; then
+	echo "offline replay platform still starts the physical sensor path" >&2
+	exit 1
+fi
+if grep -Fq 'sample/common/sample_common_vi.c' "$replay_patch"; then
+	echo "rejected source-before-enable patch is still present" >&2
+	exit 1
+fi
+grep -Fq 'VI pipe source contract failed' "$replay_patch"
+grep -Fq 'RAW metadata does not match offline replay platform' "$replay_patch"
+grep -Fq 'raw replay stopped before offline platform teardown' "$replay_patch"
+grep -Fq 'get_rgbmap_buf failed with %#x, stopping replay' "$replay_patch"
+grep -Fq 'RGB-map DMA unavailable for USER_FE; continuing without RGB map' \
+	"$replay_patch"
+grep -Fq 'RGB-map DMA descriptor is empty' "$replay_patch"
+grep -Fq 'CVI_ISP_GetVDTimeOut(0, ISP_VD_FE_END, 100)' "$replay_patch"
+grep -Fq 'single-frame raw send begin' "$replay_patch"
+grep -Fq 'single-frame raw send end, ret=%#x' "$replay_patch"
+grep -Fq 'single-frame FE wait end, ret=%#x' "$replay_patch"
+grep -Fq 'RETURN_FAILURE_IF(pCtx->drvInfo[0].vir_addr == NULL)' \
+	"$replay_patch"
+grep -Fq 'pCtx->drvInfo[0].vir_addr == NULL ||' "$replay_patch"
+if grep -Fq 'ERROR_IF(frame_source != VI_PIPE_FRAME_SOURCE_USER_FE)' \
+	"$replay_patch"; then
+	echo "RAW replay source readback is still advisory" >&2
+	exit 1
+fi
+if grep -Eq '^\+[[:space:]]*ERROR_IF\(s32Ret != CVI_SUCCESS\);' \
+	"$replay_patch"; then
+	echo "RAW replay RGB-map failure still falls through to memcpy" >&2
+	exit 1
+fi
+grep -Fq 'VENC warmup deferred until USER_FE replay' "$replay_patch"
+if grep -Eq '^[+ ].*wait venc thread ready' "$replay_patch"; then
+	echo "RAW replay still waits for live-sensor VENC warmup" >&2
+	exit 1
+fi
+grep -Fq 'setvbuf(stdout, NULL, _IONBF, 0)' "$observation_patch"
+grep -Fq 'start_raw_replay returned %#x' "$observation_patch"
+grep -Fq 'raw replay ready' "$observation_patch"
+grep -Fq 'CVI_ISP_GetVDTimeOut(0, ISP_VD_BE_END, 100)' \
+	"$observation_patch"
+grep -Fq 'BE wait frame=%u returned %#x' "$observation_patch"
+grep -Fq 'first VPSS output frame %ux%u lengths=%u/%u/%u' \
+	"$observation_patch"
+grep -Fq 'CVI_VPSS_GetChnFrame(0, 0, &stVencFrame, s32SetFrameMilliSec)' \
+	"$observation_patch"
+grep -Fq 'CVI_VENC_GetStream(VencChn, &stStream, s32SetFrameMilliSec)' \
+	"$observation_patch"
+grep -Fq 'if (!bEnableVencThread)' "$observation_patch"
+grep -Fq 'remember_failure(s32TestStatus, &s32Ret)' "$observation_patch"
+grep -Fq 'error: VPSS output wait timed out, last ret=%#x' \
+	"$observation_patch"
+grep -Fq 'sc035hgs-test_mmf-raw' "$build_script"
+grep -Fq "'RGB-map DMA descriptor is empty'" "$build_script"
+grep -Fq "'offline replay platform: sensor and MIPI startup disabled'" \
+	"$build_script"
+grep -Fq "'offline replay platform: VPSS dual MEM/ISP route configured'" \
+	"$build_script"
+grep -Fq "'offline replay platform: USER_FE selected %s'" "$build_script"
+grep -Fq "'for USER_FE geometry priming'" "$build_script"
+grep -Fq "'offline replay platform: USER_FE geometry primed %ux%u bayer=%d wdr=%d, expected ret=%#x'" \
+	"$build_script"
+grep -Fq "'offline replay platform: USER_FE confirmed %s'" \
+	"$build_script"
+grep -Fq "'before VI device enable'" "$build_script"
+grep -Fq "'after VI pipe creation'" "$build_script"
+grep -Fq "'offline replay platform: teardown complete'" "$build_script"
+grep -Fq "'single-frame raw send begin'" "$build_script"
+grep -Fq "'single-frame raw send end, ret=%#x'" "$build_script"
+grep -Fq "'single-frame FE wait end, ret=%#x'" "$build_script"
+grep -Fq "'RGB-map DMA unavailable for USER_FE; continuing without RGB map'" \
+	"$build_script"
+grep -Fq "'BE wait frame=%u returned %#x'" "$build_script"
+grep -Fq "'first VPSS output frame %ux%u lengths=%u/%u/%u'" \
+	"$build_script"
+if grep -Fq 'raw_dump_test' "$build_script"; then
+	echo "standalone RAW capture path is still present" >&2
+	exit 1
+fi
+grep -Fq 'set -eu' "$session_tool"
+grep -Fq 'systemd-run --unit=maixcam-raw-camera' "$session_tool"
+# shellcheck disable=SC2016
+grep -Fq '"$capture_camera" --ispctl raw capture "$1"' "$session_tool"
+# shellcheck disable=SC2016
+grep -Fq 'timeout 90 "$operation_binary" "$@"' "$session_tool"
+
+printf 'shell_syntax=PASS\npath_validation=PASS\nin_process_capture=PASS\n'

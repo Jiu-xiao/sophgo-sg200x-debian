@@ -1,0 +1,114 @@
+diff --git a/sample/test_mmf/Makefile b/sample/test_mmf/Makefile
+index e86f2aa..6ab0a6e 100644
+--- a/sample/test_mmf/Makefile
++++ b/sample/test_mmf/Makefile
+@@ -7,7 +7,8 @@ include ../sample.mk
+ 
+ SDIR = $(PWD)
+ SRCS = $(wildcard $(SDIR)/*.c)
+-INCS = -I$(MW_INC) -I$(ISP_INC) -I../common/ -I$(KERNEL_INC) -I$(MW_INC)/linux -I$(SDIR) -I$(SENSOR_LIST_INC)
++INCS = -I$(MW_INC) -I$(ISP_INC) -I../common/ -I$(KERNEL_INC) -I$(MW_INC)/linux -I$(SDIR) -I$(SENSOR_LIST_INC) \
++	-I$(MW_PATH)/modules/isp/common/raw_dump/src
+ 
+ SRCS_CPP += $(wildcard $(SDIR)/rtsp_server/src/*.cpp)
+ 
+@@ -61,5 +62,6 @@ MMF_LIBD = maix_mmf/release.linux
+ 
+ LIBS += -L$(SDIR)/$(MSK_LIBD) -L$(MMF_LIBD) -lrtsp -lhttp -lflv -lmov -lrtp -lmpeg -lsdk -lavcodec -lavbsf
++LIBS := -L$(MW_LIB) -lraw_dump $(LIBS)
+ 
+ # IVE_SUPPORT = 1
+ ifeq ($(IVE_SUPPORT), 1)
+diff --git a/sample/test_mmf/isp_control.c b/sample/test_mmf/isp_control.c
+index 7b47166..635ef31 100644
+--- a/sample/test_mmf/isp_control.c
++++ b/sample/test_mmf/isp_control.c
+@@ -1,4 +1,5 @@
+ #include "isp_control.h"
++#include "raw_capture.h"
+ 
+ #include <errno.h>
+ #include <poll.h>
+@@ -17,11 +18,11 @@
+ #include "cvi_isp.h"
+ #include "maix_mmf.h"
+ 
+-#define CONTROL_COMMAND_SIZE 256
++#define CONTROL_COMMAND_SIZE 512
+ #define CONTROL_RESPONSE_SIZE 4096
+ #define CONTROL_MAX_ARGUMENTS 5
+ #define CONTROL_MAX_REQUESTS_PER_FRAME 8
+-#define CONTROL_CLIENT_TIMEOUT_MS 1000
++#define CONTROL_CLIENT_TIMEOUT_MS 10000
+ #define EXPOSURE_TIME_MAX_US 33000U
+ #define MANUAL_ISO_MIN 100U
+ #define MANUAL_ISO_MAX 0x7fffffffU
+@@ -475,6 +476,7 @@ static void handle_command(int isp_channel, char *command, char *response,
+ 	char *arguments[CONTROL_MAX_ARGUMENTS] = {0};
+ 	char *saveptr = NULL;
+ 	char *token;
++	char captured_prefix[MAIXCAM_RAW_CAPTURE_PATH_SIZE];
+ 	uint32_t values[3];
+ 	int argument_count = 0;
+ 	int ret = 0;
+@@ -497,6 +499,7 @@ static void handle_command(int isp_channel, char *command, char *response,
+ 			 "gains <again> <dgain> <ispdgain>|noise get|"
+ 			 "noise save|noise restore|"
+-			 "noise set <bnr|ynr|tnr|sharpen> <iso-index> <0-255>");
++			 "noise set <bnr|ynr|tnr|sharpen> <iso-index> <0-255>|"
++			 "raw capture </mnt/data/raw/empty-directory>");
+ 		return;
+ 	}
+ 	if (!strcmp(arguments[0], "get") && argument_count == 1) {
+@@ -609,6 +612,19 @@ static void handle_command(int isp_channel, char *command, char *response,
+ 				  response, response_size);
+ 		return;
+ 	}
++	if (!strcmp(arguments[0], "raw") && argument_count == 3 &&
++	    !strcmp(arguments[1], "capture")) {
++		ret = maixcam_raw_capture(isp_channel, arguments[2],
++					  captured_prefix,
++					  sizeof(captured_prefix));
++		if (ret)
++			snprintf(response, response_size,
++				 "ERR raw_capture_failed code=%d", ret);
++		else
++			snprintf(response, response_size,
++				 "OK raw_captured prefix=%s", captured_prefix);
++		return;
++	}
+ 
+ 	snprintf(response, response_size, "ERR invalid_command");
+ }
+diff --git a/sample/test_mmf/sample_vio.c b/sample/test_mmf/sample_vio.c
+index 0730532..a4a0ed9 100644
+--- a/sample/test_mmf/sample_vio.c
++++ b/sample/test_mmf/sample_vio.c
+@@ -2484,13 +2484,6 @@ static int _test_vi_venc_h26x_rtsp(void)
+ 		void *data;
+ 		int data_size, width, height, format;
+ 
+-		if (isp_control_fd >= 0) {
+-			int control_ret = maixcam_isp_control_server_poll(
+-				isp_control_fd, 0);
+-			if (control_ret < 0)
+-				printf("ISP control request failed: %d\n", control_ret);
+-		}
+-
+ 		if (!last_vi_pop) {
+ 			start = _get_time_us();
+ 			mmf_vi_frame_free(vi_ch);
+@@ -2498,6 +2491,13 @@ static int _test_vi_venc_h26x_rtsp(void)
+ 			DEBUG("use %ld us\r\n", _get_time_us() - start);
+ 		}
+ 
++		if (isp_control_fd >= 0) {
++			int control_ret = maixcam_isp_control_server_poll(
++				isp_control_fd, 0);
++			if (control_ret < 0)
++				printf("ISP control request failed: %d\n", control_ret);
++		}
++
+ 		start = _get_time_us();
+ 		int vi_ret = mmf_vi_frame_pop(vi_ch, &data, &data_size, &width, &height, &format);
+ 		if (vi_ret != last_vi_pop) {

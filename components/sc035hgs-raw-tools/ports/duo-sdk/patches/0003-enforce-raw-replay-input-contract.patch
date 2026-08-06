@@ -1,0 +1,165 @@
+diff --git a/modules/isp/common/raw_replay_test/parse_raw.c b/modules/isp/common/raw_replay_test/parse_raw.c
+index ac64e13..96c4246 100644
+--- a/modules/isp/common/raw_replay_test/parse_raw.c
++++ b/modules/isp/common/raw_replay_test/parse_raw.c
+@@ -434,6 +434,13 @@ static CVI_S32 parse_raw_info(const char *prefix)
+ 		LOGOUT("reg_wbg_rgain = %d\n", stRawInfo.WB_RGain);
+ 	}
+ 
++	value = get_str_value(src, "reg_wbg_grgain");
++
++	if (value != NULL) {
++		stRawInfo.WB_GGain = atoi(value);
++		LOGOUT("reg_wbg_grgain = %d\n", stRawInfo.WB_GGain);
++	}
++
+ 	value = get_str_value(src, "reg_wbg_bgain");
+ 
+ 	if (value != NULL) {
+diff --git a/modules/isp/common/raw_replay_test/raw_replay_test.c b/modules/isp/common/raw_replay_test/raw_replay_test.c
+index 27d4c61..b1112c9 100644
+--- a/modules/isp/common/raw_replay_test/raw_replay_test.c
++++ b/modules/isp/common/raw_replay_test/raw_replay_test.c
+@@ -316,5 +316,6 @@ static void test(CVI_U32 u32ItemIndex)
+ {
+ 	CVI_S32 ret = CVI_SUCCESS;
++	VI_PIPE_FRAME_SOURCE_E frame_source = VI_PIPE_FRAME_SOURCE_BUTT;
+ 
+ 	CVI_U32 u32TotalFrame = 0;
+ 	CVI_U32 u32FrameIndex = 0;
+@@ -378,8 +379,13 @@ static void test(CVI_U32 u32ItemIndex)
+ 		ret = get_raw_data(u32FrameIndex, &pHeader, &pData, &u32RawSize);
+ 		ERROR_IF(ret != CVI_SUCCESS);
+ 
+ 		rawInfo = *((RAW_REPLAY_INFO *) pHeader);
++		ret = sc035hgs_replay_platform_validate_raw(&rawInfo);
++		if (ret != CVI_SUCCESS) {
++			LOGOUT("error: RAW metadata does not match offline replay platform\n");
++			return;
++		}
+ 
+ 		if (rawInfo.numFrame != rawInfo.roiFrameNum + 1) {
+ 			rawInfo.roiFrameNum = rawInfo.numFrame - 1;
+ 		}
+@@ -388,6 +389,13 @@ static void test(CVI_U32 u32ItemIndex)
+ 		raw_replay_ctrl(DISABLE_AWB_UPDATE_CTRL);
+ 	}
+ 
++	ret = CVI_VI_GetPipeFrameSource(0, &frame_source);
++	if (ret != CVI_SUCCESS || frame_source != VI_PIPE_FRAME_SOURCE_USER_FE) {
++		LOGOUT("error: VI pipe source contract failed, ret=%#x source=%d\n", ret, frame_source);
++		return;
++	}
++	LOGOUT("VI pipe source: SOURCE_USER_FE\n");
++
+ 	start_raw_replay(0);
+ 
+ 	u32WaitTimeoutCount = 0;
+@@ -1030,12 +1030,8 @@ int raw_replay_test_main(int argc, char **argv)
+ 	LOGOUT("start venc thread...\n");
+ 
+ 	s32Ret = pthread_create(&vencThreadTid, NULL, venc_thread, NULL);
+ 	RETURN_FAILURE_IF(s32Ret != 0x00);
+ 
+-	LOGOUT("wait venc thread ready...\n");
+-
+-	while (u32VencWorkFrameCount < 5) {
+-		usleep(500 * 1000);
+-	}
++	LOGOUT("VENC warmup deferred until USER_FE replay...\n");
+ 
+ 	run_test_script(argv[1]);
+@@ -1049,6 +1045,10 @@ int raw_replay_test_main(int argc, char **argv)
+ 	} else if (stTestCtx.enMd5TestStatus == MD5_TEST_FAIL) {
+ 		LOGOUT("\n\n\t MD5 TEST FAIL\n\n");
+ 	}
++
++	s32Ret = stop_raw_replay();
++	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
++	LOGOUT("raw replay stopped before offline platform teardown\n");
+ 
+ 	s32Ret = venc_deinit();
+ 	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
+diff --git a/modules/isp/common/raw_replay/raw_replay.c b/modules/isp/common/raw_replay/raw_replay.c
+--- a/modules/isp/common/raw_replay/raw_replay.c
++++ b/modules/isp/common/raw_replay/raw_replay.c
+@@ -814,6 +814,7 @@ static void raw_replay_singlefrmae(ISP_MWB_ATTR_S *pstMwbAttr, ISP_EXP_INFO_S *p
+ 	CVI_U32 frameTime = 0;
+ 	CVI_U32 frameRate = pRawReplayCtx->timingAttr.s32FrmRate;
+ 	struct timeval t1, t2;
++	CVI_BOOL bFirstFrame = CVI_TRUE;
+ 
+ 	pstVideoFrameInfo[0] = pstVideoFrame;
+ 	if (!pRawReplayCtx->timingAttr.bEnable) {
+@@ -834,8 +835,16 @@ static void raw_replay_singlefrmae(ISP_MWB_ATTR_S *pstMwbAttr, ISP_EXP_INFO_S *p
+ 		gettimeofday(&t1, NULL);
+ 
++		if (bFirstFrame)
++			LOGOUT("single-frame raw send begin\n");
+ 		s32Ret = CVI_VI_SendPipeRaw(1, PipeId, pstVideoFrameInfo, 0);
++		if (bFirstFrame)
++			LOGOUT("single-frame raw send end, ret=%#x\n", s32Ret);
+ 		ERROR_IF(s32Ret != CVI_SUCCESS);
+-		CVI_ISP_GetVDTimeOut(0, ISP_VD_FE_END, 0);
++		s32Ret = CVI_ISP_GetVDTimeOut(0, ISP_VD_FE_END, 100);
++		if (bFirstFrame) {
++			LOGOUT("single-frame FE wait end, ret=%#x\n", s32Ret);
++			bFirstFrame = CVI_FALSE;
++		}
+ 
+ 		gettimeofday(&t2, NULL);
+ 
+@@ -959,7 +968,15 @@ static void *raw_replay_thread(void *param)
+ 		update_video_frame(&stVideoFrame);
+ #if defined(__CV181X__) || defined(__CV180X__)
+ 		s32Ret = get_rgbmap_buf(pRawReplayCtx);
+-		ERROR_IF(s32Ret != CVI_SUCCESS);
++		if (s32Ret != CVI_SUCCESS) {
++			if (pRawReplayCtx->drvInfo[0].phy_addr == 0 || pRawReplayCtx->drvInfo[0].size == 0) {
++				LOGOUT("RGB-map DMA unavailable for USER_FE; continuing without RGB map\n");
++			} else {
++				LOGOUT("error: get_rgbmap_buf failed with %#x, stopping replay\n", s32Ret);
++				pRawReplayCtx->bRawReplayThreadEnabled = false;
++				break;
++			}
++		}
+ #endif
+ 		pRawReplayCtx->isRawReplayReady = true;
+ 		if (pRawReplayCtx->u32TotalFrame > 1) {
+@@ -999,7 +1016,12 @@ static CVI_S32 get_rgbmap_buf(RAW_REPLAY_CTX_S *pCtx)
+ 	s32Ret = vi_get_rgbmap_le_buf(fd, &pCtx->drvInfo[0]);
+ 	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
++	if (pCtx->drvInfo[0].phy_addr == 0 || pCtx->drvInfo[0].size == 0) {
++		LOGOUT("RGB-map DMA descriptor is empty\n");
++	}
++	RETURN_FAILURE_IF(pCtx->drvInfo[0].phy_addr == 0 || pCtx->drvInfo[0].size == 0);
+ 	pCtx->drvInfo[0].vir_addr = (CVI_U8 *) CVI_SYS_Mmap(pCtx->drvInfo[0].phy_addr,
+ 			pCtx->drvInfo[0].size * 3);
++	RETURN_FAILURE_IF(pCtx->drvInfo[0].vir_addr == NULL);
+ 	LOGOUT("rgbmap le vir_addr:%p size:%d\n",
+ 		pCtx->drvInfo[0].vir_addr, pCtx->drvInfo[0].size);
+ 
+@@ -1007,7 +1029,12 @@ static CVI_S32 get_rgbmap_buf(RAW_REPLAY_CTX_S *pCtx)
+ 		s32Ret = vi_get_rgbmap_se_buf(fd, &pCtx->drvInfo[1]);
+ 		RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
++		if (pCtx->drvInfo[1].phy_addr == 0 || pCtx->drvInfo[1].size == 0) {
++			LOGOUT("RGB-map DMA descriptor is empty\n");
++		}
++		RETURN_FAILURE_IF(pCtx->drvInfo[1].phy_addr == 0 || pCtx->drvInfo[1].size == 0);
+ 		pCtx->drvInfo[1].vir_addr = (CVI_U8 *) CVI_SYS_Mmap(pCtx->drvInfo[1].phy_addr,
+ 				pCtx->drvInfo[1].size * 3);
++		RETURN_FAILURE_IF(pCtx->drvInfo[1].vir_addr == NULL);
+ 		LOGOUT("rgbmap se vir_addr:%p size:%d\n",
+ 			pCtx->drvInfo[1].vir_addr, pCtx->drvInfo[1].size);
+ 	}
+@@ -1122,5 +1149,10 @@ static void write_rgbmap(RAW_REPLAY_CTX_S *pCtx, int index)
+ {
+ 	RGBMAP_INFO *tmpAddr = pCtx->rgbMapInfo + index;
+ 
++	if (pCtx->drvInfo[0].vir_addr == NULL ||
++		(pCtx->pRawHeader[0].enWDR && pCtx->drvInfo[1].vir_addr == NULL)) {
++		return;
++	}
++
+ 	if (pCtx->pRawHeader[0].enWDR) {
+ 		CVI_U8 *dstLe = pCtx->drvInfo[0].vir_addr + pCtx->rgbMapIdx * pCtx->drvInfo[0].size;

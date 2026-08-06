@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-  [ValidateSet('test', 'firmware', 'modules', 'middleware', 'image', 'verify', 'toolchain')]
+  [ValidateSet('test', 'firmware', 'modules', 'middleware', 'raw-tools', 'image', 'verify', 'toolchain')]
   [string]$Target = 'verify',
   [string]$Board = 'maixcam',
   [ValidateSet('sd', 'emmc')]

@@ -1,0 +1,54 @@
+diff --git a/modules/isp/common/inc/pipe_helper.h b/modules/isp/common/inc/pipe_helper.h
+--- a/modules/isp/common/inc/pipe_helper.h
++++ b/modules/isp/common/inc/pipe_helper.h
+@@ -165,7 +165,7 @@ static inline CVI_S32 vpss_init(void)
+ 	stVpssGrpAttr.enPixelFormat = VI_PIXEL_FORMAT;
+ 	stVpssGrpAttr.u32MaxW = stInputSize.u32Width;
+ 	stVpssGrpAttr.u32MaxH = stInputSize.u32Height;
+-	stVpssGrpAttr.u8VpssDev = 0;
++	stVpssGrpAttr.u8VpssDev = 1;
+ 
+ 	abChnEnable[0] = CVI_TRUE;
+ 	astVpssChnAttr[VpssChn].u32Width                    = stInputSize.u32Width;
+diff --git a/modules/isp/common/raw_replay_test/raw_replay_test.c b/modules/isp/common/raw_replay_test/raw_replay_test.c
+--- a/modules/isp/common/raw_replay_test/raw_replay_test.c
++++ b/modules/isp/common/raw_replay_test/raw_replay_test.c
+@@ -16,6 +16,7 @@
+ 
+ #define _ENABLE_JPEG 1
+ #include "../inc/pipe_helper.h"
++#include "replay_platform.h"
+ 
+ #include "../raw_replay/raw_replay.h"
+ 
+@@ -1014,7 +1015,8 @@ int raw_replay_test_main(int argc, char **argv)
+ 
+ 	LOGOUT("init sys vi...\n");
+ 
+-	s32Ret = sys_vi_init();
++	s32Ret = sc035hgs_replay_platform_init(&stInputSize,
++		&enSensorPicSize);
+ 	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
+ 
+ 	LOGOUT("init vpss...\n");
+@@ -1060,7 +1062,7 @@ int raw_replay_test_main(int argc, char **argv)
+ 	s32Ret = vpss_deinit();
+ 	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
+ 
+-	s32Ret = sys_vi_deinit();
++	s32Ret = sc035hgs_replay_platform_deinit();
+ 	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
+ 
+ 	return s32Ret;
+diff --git a/modules/isp/common/raw_replay_test/raw_replay_test.mk b/modules/isp/common/raw_replay_test/raw_replay_test.mk
+--- a/modules/isp/common/raw_replay_test/raw_replay_test.mk
++++ b/modules/isp/common/raw_replay_test/raw_replay_test.mk
+@@ -20,6 +20,8 @@ endif
+ 
+ INCS += -I$(ISP_COMMON_PATH)/inc
+ INCS += -I$(ISP_COMMON_PATH)/raw_replay_test
++INCS += -I$(ISP_COMMON_PATH)/raw_replay
++INCS += -I$(SDIR)
+ INCS += -I$(ISP_3A_PATH)
+ INCS += -I$(SDIR)/../../modules/sys/include
+ 

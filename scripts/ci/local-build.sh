@@ -145,6 +145,7 @@ case "$target" in
 		;;
 	test)
 		make -C /workspace/components/sg2002-ipc test OUTPUT_DIR=/output/host-tests
+		make -C /workspace/components/sc035hgs-raw-tools test
 		;;
 	firmware)
 		run_cache firmware
@@ -169,6 +170,14 @@ case "$target" in
 		(cd /output && sha256sum "${board}_test_mmf" \
 			> "${board}_test_mmf.sha256")
 		;;
+	raw-tools)
+		run_cache linux osdrv middleware
+		run_builder_make middleware
+		make -C /workspace/components/sc035hgs-raw-tools build \
+			BOARD="$board" SDK_CACHE=/sdk-cache \
+			BOARD_BUILD_ROOT="$build_root" OUTPUT_DIR=/output \
+			CROSS_COMPILE="$CROSS_COMPILE"
+		;;
 	image)
 		run_cache firmware linux osdrv middleware boot rootfs
 		run_builder_make image
@@ -176,6 +185,7 @@ case "$target" in
 		;;
 	verify)
 		make -C /workspace/components/sg2002-ipc test OUTPUT_DIR=/output/host-tests
+		make -C /workspace/components/sc035hgs-raw-tools test
 		validate_args=(--board "$board" --storage "$storage" --output "$output" --allow-missing-image)
 		if [[ -n $source_output ]]; then
 			validate_args+=(--exclude-path "$source_output")

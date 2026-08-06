@@ -46,6 +46,7 @@ Use the smallest target matching the change:
 application or protocol       make test; make firmware
 Linux IPC library/OSdrv       make modules
 camera/ISP middleware         make middleware BOARD=maixcam-sc035hgs
+SC035HGS RAW capture/replay    make raw-tools BOARD=maixcam-sc035hgs
 kernel, DTS, or memory map    make image BOARD=maixcam
 release candidate             make verify, then full GitHub image matrix
 ```
@@ -54,6 +55,11 @@ PowerShell uses `scripts/ci/local-build.ps1` with the corresponding target.
 Outputs go to `output/` by default. The `middleware` target exports both the
 board middleware package and `<board>_test_mmf` with its SHA-256 file, without
 reassembling the rootfs or SD image.
+
+The `raw-tools` target prepares or reuses the pinned board middleware tree and
+exports a development-only `test_mmf` with in-process RAW capture, the static
+RAW replay program, and the guarded session wrapper. They are not added to the
+production image. See `components/sc035hgs-raw-tools/README.md` for usage.
 
 ## Cache invalidation
 

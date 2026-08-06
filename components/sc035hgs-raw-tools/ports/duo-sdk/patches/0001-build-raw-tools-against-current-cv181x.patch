@@ -1,0 +1,87 @@
+diff --git a/modules/isp/common/inc/pipe_helper.h b/modules/isp/common/inc/pipe_helper.h
+index 9b61cb4..7733a6f 100644
+--- a/modules/isp/common/inc/pipe_helper.h
++++ b/modules/isp/common/inc/pipe_helper.h
+@@ -51,19 +51,6 @@ static inline CVI_S32 sys_vi_init(void)
+ {
+ 	MMF_VERSION_S stVersion;
+-	SAMPLE_INI_CFG_S	   stIniCfg = {
+-		.enSource  = VI_PIPE_FRAME_SOURCE_DEV,
+-		.devNum    = 1,
+-		.enSnsType = SONY_IMX327_MIPI_2M_30FPS_12BIT,
+-		.enWDRMode = WDR_MODE_NONE,
+-		.s32BusId  = 3,
+-		.s32SnsI2cAddr = -1,
+-		.MipiDev   = 0xFF,
+-		.u8UseDualSns = 0,
+-		.enSns2Type = SONY_IMX327_SLAVE_MIPI_2M_30FPS_12BIT,
+-		.s32Sns2BusId = 0,
+-		.s32Sns2I2cAddr = -1,
+-		.Sns2MipiDev = 0xFF,
+-	};
++	SAMPLE_INI_CFG_S stIniCfg = {0};
+ 
+ 	PIC_SIZE_E enPicSize;
+ 	CVI_S32 s32Ret = CVI_SUCCESS;
+@@ -79,9 +66,12 @@ static inline CVI_S32 sys_vi_init(void)
+ 	CVI_LOG_SetLevelConf(&log_conf);
+ 
+ 	// Get config from ini if found.
+-	if (SAMPLE_COMM_VI_ParseIni(&stIniCfg)) {
+-		SAMPLE_PRT("Parse complete\n");
++	s32Ret = SAMPLE_COMM_VI_ParseIni(&stIniCfg);
++	if (s32Ret != CVI_SUCCESS) {
++		SAMPLE_PRT("Parse fail\n");
++		return s32Ret;
+ 	}
++	SAMPLE_PRT("Parse complete\n");
+ 
+ 	//Set sensor number
+ 	CVI_VI_SetDevNum(stIniCfg.devNum);
+@@ -95,7 +85,7 @@ static inline CVI_S32 sys_vi_init(void)
+ 	/************************************************
+ 	 * step2:  Get input size
+ 	 ************************************************/
+-	s32Ret = SAMPLE_COMM_VI_GetSizeBySensor(stIniCfg.enSnsType, &enPicSize);
++	s32Ret = SAMPLE_COMM_VI_GetSizeBySensor(stIniCfg.enSnsType[0], &enPicSize);
+ 	if (s32Ret != CVI_SUCCESS) {
+ 		CVI_TRACE_LOG(CVI_DBG_ERR, "SAMPLE_COMM_VI_GetSizeBySensor failed with %#x\n", s32Ret);
+ 		return s32Ret;
+diff --git a/modules/isp/common/raw_replay_test/parse_raw.c b/modules/isp/common/raw_replay_test/parse_raw.c
+index d824083..ac64e13 100644
+--- a/modules/isp/common/raw_replay_test/parse_raw.c
++++ b/modules/isp/common/raw_replay_test/parse_raw.c
+@@ -933,17 +933,9 @@ static CVI_S32 parse_roi_raw(const char *pathPrefix,
+ 	dst = (CVI_U8 *) malloc(unpackedSize);
+ 	GOTO_FAIL_IF(dst == NULL, fail);
+ 
+-	CVI_BOOL bIsTileMode = CVI_FALSE;
+-
+-#if defined(__CV181X__) || defined(__CV180X__)
+-	bIsTileMode = CVI_FALSE;
+-#else
+-#error "should check here when porting new chip"
+-#endif
+-
+-	decoderRawExtend(rawinfo, dst, bIsTileMode);
++	decoderRaw(rawinfo, dst);
+ 
+ 	if (stRawInfo.enWDR != 0) {
+ 		rawinfo.buffer = src + rawSize / 2;
+-		decoderRawExtend(rawinfo, dst + unpackedSize / 2, bIsTileMode);
++		decoderRaw(rawinfo, dst + unpackedSize / 2);
+ 	}
+ 
+diff --git a/modules/isp/common/raw_replay_test/raw_replay_test.mk b/modules/isp/common/raw_replay_test/raw_replay_test.mk
+index 9bbbfb6..0dc5c2c 100644
+--- a/modules/isp/common/raw_replay_test/raw_replay_test.mk
++++ b/modules/isp/common/raw_replay_test/raw_replay_test.mk
+@@ -4,7 +4,7 @@ ifeq ($(PARAM_FILE), )
+ 	include $(PARAM_FILE)
+ endif
+ 
+-include ../self_test.mk
++include ../sample.mk
+ include ../../modules/isp/isp.mk
+ 
+ SDIR = $(CURDIR)

@@ -368,6 +368,15 @@ def validate_component() -> None:
         fail("legacy scripts/addons/rtos-firmware still exists")
     subprocess.run([sys.executable, str(component / "tools/verify_layout.py")], check=True)
 
+    raw_component = REPO_ROOT / "components/sc035hgs-raw-tools"
+    raw_required = ("Makefile", "README.md", "src", "ports", "tools", "tests")
+    for name in raw_required:
+        if not (raw_component / name).exists():
+            fail(f"component path is missing: {raw_component / name}")
+    subprocess.run(
+        ["bash", str(raw_component / "tests/run_host_tests.sh")], check=True
+    )
+
 
 def one_package(output: Path, pattern: str, label: str) -> Path:
     matches = sorted(output.glob(pattern))

@@ -1,0 +1,472 @@
+diff --git a/modules/isp/common/raw_replay_test/raw_replay_test.c b/modules/isp/common/raw_replay_test/raw_replay_test.c
+--- a/modules/isp/common/raw_replay_test/raw_replay_test.c
++++ b/modules/isp/common/raw_replay_test/raw_replay_test.c
+@@ -168,6 +168,17 @@ static pthread_t vencThreadTid;
+ static CVI_U32 u32RecordFrameCount;
+ static CVI_U32 u32VencWorkFrameCount;
+ 
++static CVI_S32 s32TestStatus;
++static CVI_S32 s32VencThreadStatus;
++static CVI_S32 s32LastVpssStatus;
++static bool bRawReplayStarted;
++
++static void remember_failure(CVI_S32 candidate, CVI_S32 *status)
++{
++	if (candidate != CVI_SUCCESS && *status == CVI_SUCCESS)
++		*status = candidate;
++}
++
+ static void load_pq_bin(void)
+ {
+ 	CVI_S32 s32Ret = CVI_SUCCESS;
+@@ -327,7 +338,10 @@ static void test(CVI_U32 u32ItemIndex)
+ 	CVI_U32 u32WaitTimeoutCount = 0;
+ 
+ 	ret = get_raw_data_info(u32ItemIndex, &u32TotalFrame, &prefix);
+-	ERROR_IF(ret != CVI_SUCCESS);
++	if (ret != CVI_SUCCESS) {
++		remember_failure(ret, &s32TestStatus);
++		return;
++	}
+ 
+ 	LOGOUT("\n\nstart, index: %d, total frame: %d, %s\n\n",
+ 		u32ItemIndex, u32TotalFrame, prefix);
+@@ -353,7 +367,11 @@ static void test(CVI_U32 u32ItemIndex)
+ 	LOGOUT("output dir: %s\n", pathPrefix);
+ 
+ 	if (access(pathPrefix, F_OK) != 0) {
+-		ERROR_IF(mkdir(pathPrefix, 0755) != 0);
++		if (mkdir(pathPrefix, 0755) != 0) {
++			LOGOUT("error: output directory creation failed: %s\n", strerror(errno));
++			remember_failure(CVI_FAILURE, &s32TestStatus);
++			return;
++		}
+ 	}
+ 
+ 	length = strlen(prefix);
+@@ -378,12 +396,16 @@ static void test(CVI_U32 u32ItemIndex)
+ 		LOGOUT("load data, total frame: %d, index: %d\n", u32TotalFrame, u32FrameIndex);
+ 
+ 		ret = get_raw_data(u32FrameIndex, &pHeader, &pData, &u32RawSize);
+-		ERROR_IF(ret != CVI_SUCCESS);
++		if (ret != CVI_SUCCESS) {
++			remember_failure(ret, &s32TestStatus);
++			return;
++		}
+ 
+ 		rawInfo = *((RAW_REPLAY_INFO *) pHeader);
+ 		ret = sc035hgs_replay_platform_validate_raw(&rawInfo);
+ 		if (ret != CVI_SUCCESS) {
+ 			LOGOUT("error: RAW metadata does not match offline replay platform\n");
++			remember_failure(ret, &s32TestStatus);
+ 			return;
+ 		}
+ 
+@@ -392,7 +414,10 @@ static void test(CVI_U32 u32ItemIndex)
+ 		}
+ 
+ 		ret = set_raw_replay_data(&rawInfo, pData, u32TotalFrame, u32FrameIndex, u32RawSize);
+-		ERROR_IF(ret != CVI_SUCCESS);
++		if (ret != CVI_SUCCESS) {
++			remember_failure(ret, &s32TestStatus);
++			return;
++		}
+ 	}
+ 
+ 	if (!stTestCtx.bEnableMd5Test) {
+@@ -402,17 +427,30 @@ static void test(CVI_U32 u32ItemIndex)
+ 	if (ret != CVI_SUCCESS || frame_source != VI_PIPE_FRAME_SOURCE_USER_FE) {
+ 		LOGOUT("error: VI pipe source contract failed, ret=%#x source=%d\n", ret, frame_source);
++		remember_failure(ret == CVI_SUCCESS ? CVI_FAILURE : ret,
++			&s32TestStatus);
+ 		return;
+ 	}
+ 	LOGOUT("VI pipe source: SOURCE_USER_FE\n");
+ 
+-	start_raw_replay(0);
++	ret = start_raw_replay(0);
++	LOGOUT("start_raw_replay returned %#x\n", ret);
++	if (ret != CVI_SUCCESS) {
++		remember_failure(ret, &s32TestStatus);
++		return;
++	}
++	bRawReplayStarted = true;
+ 
+ 	u32WaitTimeoutCount = 0;
+ 	while (!is_raw_replay_ready() && u32WaitTimeoutCount < WAIT_TIMEOUT_COUNT) {
+ 		u32WaitTimeoutCount++;
+ 		usleep(500 * 1000);
+ 	}
+-	ERROR_IF(u32WaitTimeoutCount >= WAIT_TIMEOUT_COUNT);
++	if (!is_raw_replay_ready()) {
++		LOGOUT("error: raw replay ready timeout\n");
++		remember_failure(CVI_FAILURE, &s32TestStatus);
++		return;
++	}
++	LOGOUT("raw replay ready\n");
+ 
+ 	load_pq_bin();
+ 
+@@ -424,9 +462,16 @@ static void test(CVI_U32 u32ItemIndex)
+ 		md5_test_config();
+ 	}
+ 
+ 	for (CVI_U8 i = 0; i < WAIT_ISP_STABLE_FRAME; i++) {
+-		CVI_ISP_GetVDTimeOut(0, ISP_VD_BE_END, 0);
++		ret = CVI_ISP_GetVDTimeOut(0, ISP_VD_BE_END, 100);
++		if (i == 0 || ret != CVI_SUCCESS)
++			LOGOUT("BE wait frame=%u returned %#x\n", i, ret);
++		if (ret != CVI_SUCCESS) {
++			remember_failure(ret, &s32TestStatus);
++			return;
++		}
+ 	}
++	LOGOUT("BE stable wait complete, frames=%u\n", WAIT_ISP_STABLE_FRAME);
+ 
+ 	if (!stTestCtx.bEnableMd5Test && (u32TotalFrame > 1)) {
+ 
+@@ -450,11 +495,24 @@ static void test(CVI_U32 u32ItemIndex)
+ 	bEnableDumpYuv = true;
+ 
+ 	u32WaitTimeoutCount = 0;
+-	while (bEnableDumpYuv && u32WaitTimeoutCount < WAIT_TIMEOUT_COUNT) {
++	while (bEnableDumpYuv && s32VencThreadStatus == CVI_SUCCESS &&
++		u32WaitTimeoutCount < WAIT_TIMEOUT_COUNT) {
+ 		u32WaitTimeoutCount++;
+ 		usleep(500 * 1000);
+ 	}
+-	ERROR_IF(u32WaitTimeoutCount >= WAIT_TIMEOUT_COUNT);
++	if (s32VencThreadStatus != CVI_SUCCESS) {
++		LOGOUT("error: VENC worker failed, ret=%#x\n", s32VencThreadStatus);
++		remember_failure(s32VencThreadStatus, &s32TestStatus);
++		return;
++	}
++	if (bEnableDumpYuv) {
++		LOGOUT("error: VPSS output wait timed out, last ret=%#x\n",
++			s32LastVpssStatus);
++		bEnableDumpYuv = false;
++		remember_failure(CVI_FAILURE, &s32TestStatus);
++		return;
++	}
++	LOGOUT("VPSS output frame dump complete\n");
+ 
+ 	if (stTestCtx.bEnableMd5Test) {
+ 		md5_test();
+@@ -505,6 +563,9 @@ static void *venc_thread(void *params)
+ 	params = params;
+ 
+ 	CVI_S32 s32Ret = CVI_SUCCESS;
++	bool bFirstVpssFrame = true;
++	bool bVpssFrameHeld = false;
++	bool bVencStreamHeld = false;
+ 
+ 	FILE *fp = NULL;
+ 	char path[PATH_MAX_LEN] = { 0 };
+@@ -514,7 +575,7 @@ static void *venc_thread(void *params)
+ #endif
+ 	VENC_CHN VencChn = _H264_VENC_CHN;
+ 
+-	CVI_S32 s32SetFrameMilliSec = 20000;
++	CVI_S32 s32SetFrameMilliSec = 100;
+ 
+ 	VIDEO_FRAME_INFO_S stVencFrame;
+ 
+@@ -529,6 +590,19 @@ static void *venc_thread(void *params)
+ 	while (bEnableVencThread) {
+ 
+ tryAgain:
++		if (bVencStreamHeld) {
++			s32Ret = CVI_VENC_ReleaseStream(VencChn, &stStream);
++			remember_failure(s32Ret, &s32VencThreadStatus);
++			bVencStreamHeld = false;
++		}
++		if (bVpssFrameHeld) {
++			s32Ret = CVI_VPSS_ReleaseChnFrame(0, 0, &stVencFrame);
++			remember_failure(s32Ret, &s32VencThreadStatus);
++			bVpssFrameHeld = false;
++		}
++
++		if (!bEnableVencThread)
++			break;
+ 
+ 		if (stStream.pstPack != NULL) {
+ 			free(stStream.pstPack);
+@@ -537,12 +611,29 @@ static void *venc_thread(void *params)
+ 
+ 		memset(&stVencFrame, 0, sizeof(VIDEO_FRAME_INFO_S));
+ 		s32Ret = CVI_VPSS_GetChnFrame(0, 0, &stVencFrame, s32SetFrameMilliSec);
+-		GOTO_FAIL_IF(s32Ret != CVI_SUCCESS, tryAgain);
++		s32LastVpssStatus = s32Ret;
++		if (s32Ret != CVI_SUCCESS)
++			goto tryAgain;
++		bVpssFrameHeld = true;
++		if (bFirstVpssFrame) {
++			LOGOUT("first VPSS output frame %ux%u lengths=%u/%u/%u\n",
++				stVencFrame.stVFrame.u32Width,
++				stVencFrame.stVFrame.u32Height,
++				stVencFrame.stVFrame.u32Length[0],
++				stVencFrame.stVFrame.u32Length[1],
++				stVencFrame.stVFrame.u32Length[2]);
++			bFirstVpssFrame = false;
++		}
+ 
+ 		if (bEnableDumpYuv) {
+ 			snprintf(path, PATH_MAX_LEN, "%s.yuv", pathPrefix);
+ 			LOGOUT("save %s\n\n", path);
+-			dump_yuv(path, &stVencFrame);
++			s32Ret = dump_yuv(path, &stVencFrame);
++			if (s32Ret != CVI_SUCCESS) {
++				remember_failure(s32Ret, &s32VencThreadStatus);
++				bEnableDumpYuv = false;
++				goto tryAgain;
++			}
+ #ifdef _ENABLE_JPEG
+ 			bDumpJpeg = true;
+ 			VencChn = _JPEG_VENC_CHN;
+@@ -581,8 +672,9 @@ static void *venc_thread(void *params)
+ 		stStream.pstPack = (VENC_PACK_S *)malloc(sizeof(VENC_PACK_S) * stStat.u32CurPacks);
+ 		GOTO_FAIL_IF(stStream.pstPack == NULL, tryAgain);
+ 
+-		s32Ret = CVI_VENC_GetStream(VencChn, &stStream, -1);
++		s32Ret = CVI_VENC_GetStream(VencChn, &stStream, s32SetFrameMilliSec);
+ 		GOTO_FAIL_IF(s32Ret != CVI_SUCCESS, tryAgain);
++		bVencStreamHeld = true;
+ 
+ 		if (bEnableDumpStream) {
+ 
+@@ -634,19 +726,23 @@ static void *venc_thread(void *params)
+ 
+ 			s32Ret = CVI_VENC_ReleaseStream(VencChn, &stStream);
+ 			GOTO_FAIL_IF(s32Ret != CVI_SUCCESS, tryAgain);
++			bVencStreamHeld = false;
+ 
+ 			VencChn = _H264_VENC_CHN;
+ 
+ 		} else {
+ 			s32Ret = CVI_VENC_ReleaseStream(VencChn, &stStream);
+ 			GOTO_FAIL_IF(s32Ret != CVI_SUCCESS, tryAgain);
++			bVencStreamHeld = false;
+ 		}
+ #else
+ 		s32Ret = CVI_VENC_ReleaseStream(VencChn, &stStream);
+ 		GOTO_FAIL_IF(s32Ret != CVI_SUCCESS, tryAgain);
++		bVencStreamHeld = false;
+ #endif
+ 		s32Ret = CVI_VPSS_ReleaseChnFrame(0, 0, &stVencFrame);
+ 		GOTO_FAIL_IF(s32Ret != CVI_SUCCESS, tryAgain);
++		bVpssFrameHeld = false;
+ 
+ 		u32VencWorkFrameCount++;
+ 	}
+@@ -679,6 +775,8 @@ static void run_test(void)
+ {
+ 	static bool bReplaceSensorCfg;
+ 
++	CVI_S32 ret = CVI_SUCCESS;
++	bool bRanItem = false;
+ 	CVI_U32 u32TotalItem = 0;
+ 	CVI_U32 u32ItemIndex = 0;
+ 
+@@ -690,7 +788,9 @@ static void run_test(void)
+ 
+ 	dir = opendir(stTestCtx.test_dir);
+ 
+-	if (dir == NULL) {
++	if (dir == NULL) {
++		LOGOUT("error: test directory open failed: %s\n", strerror(errno));
++		remember_failure(CVI_FAILURE, &s32TestStatus);
+ 		return;
+ 	}
+ 
+@@ -706,7 +806,11 @@ static void run_test(void)
+ 			memset(buffer, 0, PATH_MAX_LEN);
+ 			snprintf(buffer, PATH_MAX_LEN, "%s/%s", stTestCtx.test_dir, ptr->d_name);
+
+-			parse_raw_init(buffer, stTestCtx.roi_info, &u32TotalItem);
++			ret = parse_raw_init(buffer, stTestCtx.roi_info, &u32TotalItem);
++			if (ret != CVI_SUCCESS) {
++				remember_failure(ret, &s32TestStatus);
++				break;
++			}
+
+ 			LOGOUT("work path: %s, test item: %d\n", buffer, u32TotalItem);
+ 
+@@ -753,12 +857,16 @@ static void run_test(void)
+ 			}
+
+ 			for (u32ItemIndex = 0; u32ItemIndex < u32TotalItem; u32ItemIndex++) {
++				bRanItem = true;
+ 				LOGOUT("\n\nstart test item: %d, total: %d\n\n", u32ItemIndex, u32TotalItem);
+ 				test(u32ItemIndex);
++				if (s32TestStatus != CVI_SUCCESS)
++					break;
+ 				//printfMemInfo();
+ 			}
+
+-			parse_raw_deinit();
++			ret = parse_raw_deinit();
++			remember_failure(ret, &s32TestStatus);
+
+ 			if (bReplaceSensorCfg) {
+ 				system("mv /mnt/data/sensor_cfg.ini.bak /mnt/data/sensor_cfg.ini");
+@@ -765,6 +873,14 @@ static void run_test(void)
+ 			}
+ 		}
++		if (s32TestStatus != CVI_SUCCESS)
++			break;
+ 	}
++
++	closedir(dir);
++	if (!bRanItem) {
++		LOGOUT("error: no RAW replay item was run\n");
++		remember_failure(CVI_FAILURE, &s32TestStatus);
++	}
+ }
+ 
+ static char *get_str_value(const char *src, const char *str)
+@@ -814,6 +930,7 @@ static void run_test_script(char *script_file)
+ 	char *end = NULL;
+ 	char *value = NULL;
+ 	struct stat statbuf;
++	bool bRanTest = false;
+ 
+ 	fp = fopen(script_file, "rb");
+ 	GOTO_FAIL_IF(fp == NULL, fail);
+@@ -967,10 +1084,17 @@ static void run_test_script(char *script_file)
+ 			stTestCtx.bEnableMd5Test = false;
+ 		}
+ 
++		bRanTest = true;
+ 		run_test();
++		if (s32TestStatus != CVI_SUCCESS)
++			goto fail;
+ 	}
+ 
+ fail:
++	if (!bRanTest && s32TestStatus == CVI_SUCCESS) {
++		LOGOUT("error: replay script did not run a test\n");
++		remember_failure(CVI_FAILURE, &s32TestStatus);
++	}
+ 
+ 	if (fp != NULL) {
+ 		fclose(fp);
+@@ -1007,6 +1131,12 @@ void printfScriptTemplate(void)
+ int raw_replay_test_main(int argc, char **argv)
+ {
+ 	CVI_S32 s32Ret = CVI_SUCCESS;
++	CVI_S32 cleanupRet = CVI_SUCCESS;
++	CVI_BOOL platformInitialized = CVI_FALSE;
++	CVI_BOOL vpssInitialized = CVI_FALSE;
++	CVI_BOOL vencInitialized = CVI_FALSE;
++	CVI_BOOL vencThreadStarted = CVI_FALSE;
++	setvbuf(stdout, NULL, _IONBF, 0);
+ 
+ 	if (argc != 2) {
+ 		LOGOUT("ERROR:\n");
+@@ -1023,6 +1153,10 @@ int raw_replay_test_main(int argc, char **argv)
+ 	bEnableVencThread = true;
+ 	bEnableDumpYuv = false;
+ 	bEnableDumpStream = false;
++	bRawReplayStarted = false;
++	s32TestStatus = CVI_SUCCESS;
++	s32VencThreadStatus = CVI_SUCCESS;
++	s32LastVpssStatus = CVI_FAILURE;
+ 
+ 	memset(&stTestCtx, 0, sizeof(RAW_REPLAY_TEST_CTX_S));
+ 
+@@ -1030,22 +1164,30 @@ int raw_replay_test_main(int argc, char **argv)
+ 
+ 	s32Ret = sc035hgs_replay_platform_init(&stInputSize,
+ 		&enSensorPicSize);
+-	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
++	if (s32Ret != CVI_SUCCESS)
++		goto cleanup;
++	platformInitialized = CVI_TRUE;
+ 
+ 	LOGOUT("init vpss...\n");
+ 
+ 	s32Ret = vpss_init();
+-	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
++	if (s32Ret != CVI_SUCCESS)
++		goto cleanup;
++	vpssInitialized = CVI_TRUE;
+ 
+ 	LOGOUT("init venc...\n");
+ 
+ 	s32Ret = venc_init();
+-	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
++	if (s32Ret != CVI_SUCCESS)
++		goto cleanup;
++	vencInitialized = CVI_TRUE;
+ 
+ 	LOGOUT("start venc thread...\n");
+ 
+ 	s32Ret = pthread_create(&vencThreadTid, NULL, venc_thread, NULL);
+-	RETURN_FAILURE_IF(s32Ret != 0x00);
++	if (s32Ret != 0x00)
++		goto cleanup;
++	vencThreadStarted = CVI_TRUE;
+ 
+ 	LOGOUT("VENC warmup deferred until USER_FE replay...\n");
+ 
+@@ -1053,28 +1195,47 @@ int raw_replay_test_main(int argc, char **argv)
+ 
+ 	bEnableVencThread = false;
+ 
+-	pthread_join(vencThreadTid, NULL);
++	cleanupRet = pthread_join(vencThreadTid, NULL);
++	remember_failure(cleanupRet == 0 ? CVI_SUCCESS : CVI_FAILURE, &s32Ret);
++	vencThreadStarted = CVI_FALSE;
++	remember_failure(s32VencThreadStatus, &s32Ret);
+ 
+ 	LOGOUT("\n\ntest finish ...\n\n");
+ 
++	remember_failure(s32TestStatus, &s32Ret);
+ 	if (stTestCtx.enMd5TestStatus == MD5_TEST_SUCCEED) {
+ 		LOGOUT("\n\n\t MD5 TEST SUCCESS\n\n");
+ 	} else if (stTestCtx.enMd5TestStatus == MD5_TEST_FAIL) {
+ 		LOGOUT("\n\n\t MD5 TEST FAIL\n\n");
+ 	}
+ 
+-	s32Ret = stop_raw_replay();
+-	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
+-	LOGOUT("raw replay stopped before offline platform teardown\n");
+-
+-	s32Ret = venc_deinit();
+-	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
+-
+-	s32Ret = vpss_deinit();
+-	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
+-
+-	s32Ret = sc035hgs_replay_platform_deinit();
+-	RETURN_FAILURE_IF(s32Ret != CVI_SUCCESS);
++cleanup:
++	bEnableVencThread = false;
++	if (vencThreadStarted) {
++		cleanupRet = pthread_join(vencThreadTid, NULL);
++		remember_failure(cleanupRet == 0 ? CVI_SUCCESS : CVI_FAILURE,
++			&s32Ret);
++		remember_failure(s32VencThreadStatus, &s32Ret);
++	}
++	if (bRawReplayStarted) {
++		cleanupRet = stop_raw_replay();
++		remember_failure(cleanupRet, &s32Ret);
++		if (cleanupRet == CVI_SUCCESS)
++			LOGOUT("raw replay stopped before offline platform teardown\n");
++		bRawReplayStarted = false;
++	}
++	if (vencInitialized) {
++		cleanupRet = venc_deinit();
++		remember_failure(cleanupRet, &s32Ret);
++	}
++	if (vpssInitialized) {
++		cleanupRet = vpss_deinit();
++		remember_failure(cleanupRet, &s32Ret);
++	}
++	if (platformInitialized) {
++		cleanupRet = sc035hgs_replay_platform_deinit();
++		remember_failure(cleanupRet, &s32Ret);
++	}
+ 
+ 	return s32Ret;
+ }
