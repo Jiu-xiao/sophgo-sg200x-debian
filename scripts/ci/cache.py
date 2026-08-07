@@ -24,7 +24,7 @@ LAYERS = ("firmware", "linux", "osdrv", "middleware", "boot", "rootfs")
 LAYER_COMPLETION_PATHS = {
     "firmware": ("sg2002-ipc-build-stamp",),
     "linux": ("linux-compile-stamp", "kernel/.git/HEAD"),
-    "osdrv": ("osdrv-package-stamp", "osdrv/.git/HEAD"),
+    "osdrv": ("osdrv-compile-stamp", "osdrv/.git/HEAD"),
     "middleware": ("middleware-package-stamp", "middleware/.git/HEAD"),
     "boot": (
         "fsbl-package-stamp",

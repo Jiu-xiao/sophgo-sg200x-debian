@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a development test_mmf RAW owner and the standalone replay tool.
+# Build the development capture, replay, and vendor RAW unpacking tools.
 set -euo pipefail
 
 port_root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -51,7 +51,8 @@ fi
 
 work_root=$(mktemp -d /tmp/sc035hgs-raw-tools.XXXXXX)
 middleware_work=$work_root/middleware
-vendor_linux_include=$work_root/vendor-linux-include
+vendor_linux_flat=$work_root/vendor-linux-include
+vendor_linux_root=$work_root/vendor-linux-root
 repro_flags="-ffile-prefix-map=$work_root=/usr/src/sc035hgs-raw-tools -fdebug-prefix-map=$work_root=/usr/src/sc035hgs-raw-tools"
 trap 'rm -rf "$work_root"' EXIT
 
@@ -67,7 +68,12 @@ git --git-dir="$vendor_git" archive "$RTOS_SDK_COMMIT" \
 	cvi_mpi/modules/isp/common/inc \
 	cvi_mpi/modules/isp/common/raw_replay_test \
 	| tar -x -C "$middleware_work" --strip-components=1
-mv "$middleware_work/include/linux" "$vendor_linux_include"
+mv "$middleware_work/include/linux" "$vendor_linux_flat"
+mkdir -p "$vendor_linux_root"
+ln -s ../vendor-linux-include "$vendor_linux_root/linux"
+test -f "$vendor_linux_flat/cvi_common.h"
+test -f "$vendor_linux_root/linux/cvi_common.h"
+test ! -e "$middleware_work/include/linux"
 git -C "$middleware_work" apply \
 	"$port_root/patches/0001-build-raw-tools-against-current-cv181x.patch"
 cp "$component_root/src/test_mmf/raw_capture.c" \
@@ -119,25 +125,46 @@ build_env=(
 )
 middleware_libs=$(PKG_CONFIG_PATH="$middleware_work/pkgconfig" pkg-config --libs \
 	--define-variable=mw_dir="$middleware_work" cvi_common cvi_sample)
+isp_algo_archive=$middleware_work/modules/isp/cv181x/musl_riscv64/libisp_algo.a
+test -s "$isp_algo_archive"
+isp_algo_archive_sha=$(sha256sum "$isp_algo_archive" | cut -d' ' -f1)
 
 start_epoch=$(date +%s)
 env "${build_env[@]}" \
-	CVI_TARGET_PACKAGES_INCLUDE="-I$middleware_work/component/isp/common -I$middleware_work/modules/isp/cv181x/isp_algo/inc -I$vendor_linux_include -Wno-error=format-truncation $repro_flags" \
+	CVI_TARGET_PACKAGES_INCLUDE="-I$middleware_work/component/isp/common -I$middleware_work/modules/isp/cv181x/isp_algo/inc -I$vendor_linux_flat -Wno-error=format-truncation $repro_flags" \
 	make -C "$raw_replay_lib_dir" -j"$(nproc)" \
 	KERNEL_DIR="$kernel_source" PWD="$raw_replay_lib_dir" \
 	"$middleware_work/lib/libraw_replay.a"
 env "${build_env[@]}" \
-	CVI_TARGET_PACKAGES_INCLUDE="-I$middleware_work/component/isp/common -I$middleware_work/modules/isp/cv181x/isp_algo/inc -I$vendor_linux_include -Wno-error=format-truncation $repro_flags" \
+	CVI_TARGET_PACKAGES_INCLUDE="-I$middleware_work/component/isp/common -I$middleware_work/modules/isp/cv181x/isp_algo/inc -I$vendor_linux_flat -Wno-error=format-truncation $repro_flags" \
 	make -C "$raw_replay_dir" -j"$(nproc)" \
 	KERNEL_DIR="$kernel_source" PWD="$raw_replay_dir" SAMPLE_STATIC=1 \
 	EXTRA_LDFLAGS="-Wl,--start-group -lraw_replay $middleware_libs -Wl,--end-group -lpthread -ldl -lm" all
 env "${build_env[@]}" make -C "$test_mmf_dir" -j"$(nproc)" \
 	KERNEL_DIR="$kernel_source" PWD="$test_mmf_dir" all
+case " $middleware_libs " in
+	*" -lisp_algo "*) ;;
+	*) echo "middleware link flags do not include libisp_algo" >&2; exit 1 ;;
+esac
+# shellcheck disable=SC2086
+"${cross_compile}gcc" -std=c11 -O2 -Wall -Wextra -Werror -static \
+	-ffunction-sections -fdata-sections \
+	-D_FILE_OFFSET_BITS=64 -DARCH_CV181X $repro_flags \
+	-I"$vendor_linux_root" \
+	-I"$middleware_work/component/isp/common" \
+	-I"$middleware_work/modules/isp/include/cv181x" \
+	-I"$middleware_work/modules/isp/cv181x/isp_algo/inc" \
+	"$component_root/src/raw_unpack.c" \
+	"$component_root/src/vendor_log_compat.c" \
+	"$isp_algo_archive" -Wl,--gc-sections -lm \
+	-o "$work_root/sc035hgs-raw-unpack"
 elapsed_seconds=$(( $(date +%s) - start_epoch ))
 
 install -m 0755 "$test_mmf_dir/test_mmf" \
 	"$output_dir/sc035hgs-test_mmf-raw"
 install -m 0755 "$raw_replay_dir/raw_replay_test" "$output_dir/sc035hgs-raw-replay"
+install -m 0755 "$work_root/sc035hgs-raw-unpack" \
+	"$output_dir/sc035hgs-raw-unpack"
 install -m 0755 "$component_root/tools/sc035hgs-raw-session" \
 	"$output_dir/sc035hgs-raw-session"
 
@@ -197,14 +224,16 @@ contract_markers=(
 	done
 } >"$contract_file"
 
-for binary in sc035hgs-test_mmf-raw sc035hgs-raw-replay; do
+for binary in sc035hgs-test_mmf-raw sc035hgs-raw-replay sc035hgs-raw-unpack; do
 	file "$output_dir/$binary" >"$output_dir/$binary.file.txt"
 	"${cross_compile}readelf" -h -d "$output_dir/$binary" \
 		>"$output_dir/$binary.readelf.txt"
 done
+"${cross_compile}readelf" -Ws "$output_dir/sc035hgs-raw-unpack" \
+	| grep -F 'decoderRaw' >"$output_dir/sc035hgs-raw-unpack.symbols.txt"
 (
 	cd "$output_dir"
-	sha256sum sc035hgs-test_mmf-raw sc035hgs-raw-replay \
+	sha256sum sc035hgs-test_mmf-raw sc035hgs-raw-replay sc035hgs-raw-unpack \
 		sc035hgs-raw-session sc035hgs-raw-replay.contract.txt >SHA256SUMS
 )
 {
@@ -212,6 +241,7 @@ done
 	printf 'board=%s\n' "$board"
 	printf 'vendor_commit=%s\n' "$RTOS_SDK_COMMIT"
 	printf 'middleware_commit=%s\n' "$middleware_head"
+	printf 'isp_algo_archive_sha256=%s\n' "$isp_algo_archive_sha"
 	printf 'source_date_epoch=%s\n' "$source_date_epoch"
 	printf 'build_elapsed_seconds=%s\n' "$elapsed_seconds"
 } >"$output_dir/sc035hgs-raw-tools.build.env"

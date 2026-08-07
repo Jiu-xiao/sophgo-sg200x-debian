@@ -9,12 +9,57 @@ replay_patch=$component_root/ports/duo-sdk/patches/0003-enforce-raw-replay-input
 platform_patch=$component_root/ports/duo-sdk/patches/0004-use-offline-replay-platform.patch
 observation_patch=$component_root/ports/duo-sdk/patches/0005-bound-replay-observation-and-exit.patch
 platform_source=$component_root/src/replay_platform.c
-tmp_replay_script=$(mktemp)
-trap 'rm -f "$tmp_replay_script"' EXIT
+unpack_source=$component_root/src/raw_unpack.c
+log_compat_source=$component_root/src/vendor_log_compat.c
+tmp_dir=$(mktemp -d)
+tmp_replay_script=$tmp_dir/replay.txt
+unpack_test=$tmp_dir/sc035hgs-raw-unpack-test
+trap 'rm -rf "$tmp_dir"' EXIT
 
 bash -n "$build_script"
 sh -n "$session_tool"
+test -x "$session_tool"
 "$session_tool" --help >/dev/null
+
+${CC:-cc} -std=c11 -Wall -Wextra -Werror \
+	-I"$component_root/tests/include" "$unpack_source" \
+	"$log_compat_source" "$component_root/tests/raw_unpack_decoder_stub.c" \
+	-o "$unpack_test"
+printf '\001\002\003\004\005\006\007\010\011\012\013\014' \
+	>"$tmp_dir/input.raw"
+printf '\000\001\001\001\002\001\003\001\004\001\005\001\006\001\007\001' \
+	>"$tmp_dir/expected.raw16le"
+"$unpack_test" "$tmp_dir/input.raw" 4 2 "$tmp_dir/output.raw16le" \
+	>"$tmp_dir/unpack.txt"
+cmp "$tmp_dir/expected.raw16le" "$tmp_dir/output.raw16le"
+grep -Fq 'width=4 height=2 stride=6 output_bytes=16' "$tmp_dir/unpack.txt"
+if "$unpack_test" "$tmp_dir/input.raw" 0 2 "$tmp_dir/rejected.raw16le" \
+	>/dev/null 2>&1; then
+	echo "RAW unpacker accepted zero width" >&2
+	exit 1
+fi
+if "$unpack_test" "$tmp_dir/input.raw" 4 5 "$tmp_dir/rejected.raw16le" \
+	>/dev/null 2>&1; then
+	echo "RAW unpacker accepted a non-integral compressed stride" >&2
+	exit 1
+fi
+if "$unpack_test" "$tmp_dir/input.raw" 4294967295 4294967295 \
+	"$tmp_dir/rejected.raw16le" >/dev/null 2>&1; then
+	echo "RAW unpacker accepted an overflowing decoded size" >&2
+	exit 1
+fi
+printf '\377\002\003\004\005\006\007\010\011\012\013\014' \
+	>"$tmp_dir/decoder-failure.raw"
+if "$unpack_test" "$tmp_dir/decoder-failure.raw" 4 2 \
+	"$tmp_dir/rejected.raw16le" >/dev/null 2>&1; then
+	echo "RAW unpacker ignored decoderRaw failure" >&2
+	exit 1
+fi
+if "$unpack_test" "$tmp_dir/input.raw" 4 2 "$tmp_dir/input.raw" \
+	>/dev/null 2>&1; then
+	echo "RAW unpacker accepted the input file as its output" >&2
+	exit 1
+fi
 
 if "$session_tool" capture relative/path >/dev/null 2>&1; then
 	echo "session wrapper accepted a relative capture path" >&2
@@ -22,6 +67,22 @@ if "$session_tool" capture relative/path >/dev/null 2>&1; then
 fi
 if "$session_tool" capture /tmp/raw >/dev/null 2>&1; then
 	echo "session wrapper accepted a capture path outside /mnt/data/raw" >&2
+	exit 1
+fi
+if "$session_tool" capture-series relative/path 16 >/dev/null 2>&1; then
+	echo "session wrapper accepted a relative series path" >&2
+	exit 1
+fi
+if "$session_tool" capture-series /mnt/data/raw/series 1 >/dev/null 2>&1; then
+	echo "session wrapper accepted a series count below two" >&2
+	exit 1
+fi
+if "$session_tool" capture-series /mnt/data/raw/series 11 >/dev/null 2>&1; then
+	echo "session wrapper accepted a series count above the hardware bound" >&2
+	exit 1
+fi
+if "$session_tool" capture-series /mnt/data/raw/series invalid >/dev/null 2>&1; then
+	echo "session wrapper accepted a non-numeric series count" >&2
 	exit 1
 fi
 if "$session_tool" replay relative/script >/dev/null 2>&1; then
@@ -148,6 +209,22 @@ grep -Fq 'remember_failure(s32TestStatus, &s32Ret)' "$observation_patch"
 grep -Fq 'error: VPSS output wait timed out, last ret=%#x' \
 	"$observation_patch"
 grep -Fq 'sc035hgs-test_mmf-raw' "$build_script"
+grep -Fq 'sc035hgs-raw-unpack' "$build_script"
+grep -Fq "'decoderRaw'" "$build_script"
+grep -Fq 'raw_info.stride = stride' "$unpack_source"
+grep -Fq 'decode_status = decoderRaw(raw_info, decoded)' "$unpack_source"
+grep -Fq 'encode_little_endian(decoded, pixel_count)' "$unpack_source"
+grep -Fq 'CVI_S32 *log_levels = NULL' "$log_compat_source"
+grep -Fq '"$component_root/src/vendor_log_compat.c"' "$build_script"
+grep -Fq 'isp_algo_archive=$middleware_work/modules/isp/cv181x/musl_riscv64/libisp_algo.a' \
+	"$build_script"
+grep -Fq '"$isp_algo_archive" -Wl,--gc-sections -lm' "$build_script"
+grep -Fq "printf 'isp_algo_archive_sha256=%s\\n'" "$build_script"
+grep -Fq 'mv "$middleware_work/include/linux" "$vendor_linux_flat"' \
+	"$build_script"
+grep -Fq 'ln -s ../vendor-linux-include "$vendor_linux_root/linux"' \
+	"$build_script"
+grep -Fq 'test ! -e "$middleware_work/include/linux"' "$build_script"
 grep -Fq "'RGB-map DMA descriptor is empty'" "$build_script"
 grep -Fq "'offline replay platform: sensor and MIPI startup disabled'" \
 	"$build_script"
@@ -177,8 +254,10 @@ fi
 grep -Fq 'set -eu' "$session_tool"
 grep -Fq 'systemd-run --unit=maixcam-raw-camera' "$session_tool"
 # shellcheck disable=SC2016
-grep -Fq '"$capture_camera" --ispctl raw capture "$1"' "$session_tool"
+grep -Fq 'timeout 30 "$capture_camera" --ispctl raw capture "$1"' "$session_tool"
+grep -Fq 'SERIES_FRAME=%03d STATUS=PASS' "$session_tool"
+grep -Fq 'sleep 1' "$session_tool"
 # shellcheck disable=SC2016
 grep -Fq 'timeout 90 "$operation_binary" "$@"' "$session_tool"
 
-printf 'shell_syntax=PASS\npath_validation=PASS\nin_process_capture=PASS\n'
+printf 'shell_syntax=PASS\npath_validation=PASS\nin_process_capture=PASS\nraw_unpack_contract=PASS\n'

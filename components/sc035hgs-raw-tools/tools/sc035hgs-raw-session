@@ -10,12 +10,14 @@ remoteproc_state=/sys/class/remoteproc/remoteproc0/state
 tool_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 capture_camera=$tool_dir/sc035hgs-test_mmf-raw
 replay_binary=$tool_dir/sc035hgs-raw-replay
+max_series_frames=10
 
 usage()
 {
 	cat <<'EOF'
 Usage:
   sc035hgs-raw-session capture EMPTY_OUTPUT_DIR
+  sc035hgs-raw-session capture-series EMPTY_OUTPUT_ROOT COUNT
   sc035hgs-raw-session replay SCRIPT_FILE
 EOF
 }
@@ -79,6 +81,19 @@ case $operation in
 		[ "$#" -eq 1 ] || { usage >&2; exit 2; }
 		validate_capture_path "$1"
 		operation_binary=$capture_camera
+		;;
+	capture-series)
+		[ "$#" -eq 2 ] || { usage >&2; exit 2; }
+		validate_capture_path "$1"
+		case $2 in
+			*[!0-9]*|'')
+				fail "count must be an integer from 2 to $max_series_frames"
+				;;
+		esac
+		[ "$2" -ge 2 ] && [ "$2" -le "$max_series_frames" ] ||
+			fail "count must be an integer from 2 to $max_series_frames"
+		operation_binary=$capture_camera
+		series_count=$2
 		;;
 	replay)
 		[ "$#" -eq 1 ] || { usage >&2; exit 2; }
@@ -187,7 +202,10 @@ while pgrep -x test_mmf >/dev/null 2>&1; do
 done
 sleep 2
 
-if [ "$operation" = capture ]; then
+if [ "$operation" = capture ] || [ "$operation" = capture-series ]; then
+	if [ "$operation" = capture-series ]; then
+		[ ! -e "$1" ] || fail "series output already exists: $1"
+	fi
 	mkdir -p "$1"
 	systemd-run --unit=maixcam-raw-camera \
 		--property=Type=simple \
@@ -220,7 +238,20 @@ if [ "$operation" = capture ]; then
 		'OK mode=manual gain_mode=gain exptime_us=10000 iso=100 again=1024 dgain=1024 ispdgain=1024') ;;
 		*) fail "fixed exposure did not settle: $isp_state" ;;
 	esac
-	"$capture_camera" --ispctl raw capture "$1"
+	if [ "$operation" = capture ]; then
+		timeout 30 "$capture_camera" --ispctl raw capture "$1"
+	else
+		series_root=$1
+		series_index=1
+		while [ "$series_index" -le "$series_count" ]; do
+			series_output=$(printf '%s/frame-%03d' "$series_root" "$series_index")
+			mkdir "$series_output"
+			timeout 30 "$capture_camera" --ispctl raw capture "$series_output"
+			printf 'SERIES_FRAME=%03d STATUS=PASS\n' "$series_index"
+			series_index=$((series_index + 1))
+			sleep 1
+		done
+	fi
 	operation_status=0
 	true
 	# The EXIT trap stops this development camera and restores the product service.

@@ -6,6 +6,9 @@ This component builds an isolated development workflow for the
 - `sc035hgs-test_mmf-raw` is a development-only `test_mmf` variant that owns
   the complete camera pipeline and accepts one guarded in-process RAW dump.
 - `sc035hgs-raw-replay` runs the vendor RAW replay test from a script file.
+- `sc035hgs-raw-unpack` decodes one vendor-compressed frame to a headerless,
+  row-major 16-bit little-endian Bayer frame using the pinned SDK's
+  `decoderRaw()` implementation.
 
 `sc035hgs-raw-session` temporarily replaces the normal network-camera process
 with the development variant for capture, or takes exclusive media ownership
@@ -47,6 +50,41 @@ The output directory must be empty and resolve below `/mnt/data/raw`. Capture
 is rejected unless the effective exposure and gains match exactly, and unless
 one non-empty RAW file plus its TXT and JSON metadata are present. The normal
 camera service is restored even when capture fails.
+
+For repeated same-condition frames, keep the development pipeline alive and
+capture into numbered child directories:
+
+```sh
+./sc035hgs-raw-session capture-series /mnt/data/raw/dark-series-001 8
+```
+
+`COUNT` must be from 2 to 10 and the output root must not already exist. Use
+multiple output roots for a larger sample set. The bound stays below the
+observed vendor VI failure on the twelfth continuous dump. The
+wrapper applies fixed exposure and gains once, waits one second between dumps,
+and restores the product camera only after the series finishes or fails. This
+avoids mixing camera-process restarts into temporal statistics.
+
+## Decode
+
+The captured `640x480` payload is vendor-compressed data, not generic packed
+RAW12. Decode it before calculating sensor statistics:
+
+```sh
+sc035hgs-raw-unpack INPUT.raw 640 480 OUTPUT.raw16le
+```
+
+The input size must be a nonzero multiple of the height. Its compressed stride
+is derived as `input_size / height` and passed to `RAW_INFO`; dimensions and all
+size calculations are checked for overflow. The output is exactly
+`width * height * 2` bytes. The unpacker rejects an output path that identifies
+the input file and returns nonzero when the vendor decoder fails.
+The vendor object references two logging globals normally owned by the SYS
+runtime. The standalone binary provides only those required ABI symbols with
+`log_levels` unset; it does not initialize media devices, SYS, VB, or ION.
+The pinned decoder object uses T-Head C906 instructions, so generic
+`qemu-riscv64` is not a valid runtime check; decoding must be verified on the
+target core.
 
 ## Deterministic replay
 

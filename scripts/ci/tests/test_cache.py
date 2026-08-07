@@ -62,6 +62,15 @@ class CacheInvalidationTests(unittest.TestCase):
         head.write_text("ref: refs/heads/test\n", encoding="utf-8")
         self.assertFalse(cache.layer_complete(self.root, "linux"))
 
+    def test_osdrv_compile_is_a_reusable_completed_layer(self) -> None:
+        self.create("osdrv-compile-stamp")
+        head = self.root / "osdrv/.git/HEAD"
+        head.parent.mkdir(parents=True)
+        head.write_text("ref: refs/heads/test\n", encoding="utf-8")
+
+        self.assertTrue(cache.layer_complete(self.root, "osdrv"))
+        self.assertFalse((self.root / "osdrv-package-stamp").exists())
+
     def test_rootfs_invalidation_preserves_complete_component_graphs(self) -> None:
         reusable = (
             "linux-prepare-checkout-stamp",
