@@ -167,6 +167,8 @@ install -m 0755 "$work_root/sc035hgs-raw-unpack" \
 	"$output_dir/sc035hgs-raw-unpack"
 install -m 0755 "$component_root/tools/sc035hgs-raw-session" \
 	"$output_dir/sc035hgs-raw-session"
+install -m 0755 "$component_root/tools/sc035hgs-replay-tolerance" \
+	"$output_dir/sc035hgs-replay-tolerance"
 
 replay_strings=$work_root/sc035hgs-raw-replay.strings
 "${cross_compile}strings" "$output_dir/sc035hgs-raw-replay" >"$replay_strings"
@@ -234,7 +236,8 @@ done
 (
 	cd "$output_dir"
 	sha256sum sc035hgs-test_mmf-raw sc035hgs-raw-replay sc035hgs-raw-unpack \
-		sc035hgs-raw-session sc035hgs-raw-replay.contract.txt >SHA256SUMS
+		sc035hgs-raw-session sc035hgs-replay-tolerance \
+		sc035hgs-raw-replay.contract.txt >SHA256SUMS
 )
 {
 	printf 'status=PASS\n'

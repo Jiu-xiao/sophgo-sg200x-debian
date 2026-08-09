@@ -5,6 +5,7 @@ set -euo pipefail
 component_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 build_script=$component_root/ports/duo-sdk/build.sh
 session_tool=$component_root/tools/sc035hgs-raw-session
+tolerance_tool=$component_root/tools/sc035hgs-replay-tolerance
 replay_patch=$component_root/ports/duo-sdk/patches/0003-enforce-raw-replay-input-contract.patch
 platform_patch=$component_root/ports/duo-sdk/patches/0004-use-offline-replay-platform.patch
 observation_patch=$component_root/ports/duo-sdk/patches/0005-bound-replay-observation-and-exit.patch
@@ -20,6 +21,13 @@ bash -n "$build_script"
 sh -n "$session_tool"
 test -x "$session_tool"
 "$session_tool" --help >/dev/null
+python3 - "$tolerance_tool" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+compile(source, sys.argv[1], "exec")
+PY
 
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror \
 	-I"$component_root/tests/include" "$unpack_source" \
@@ -83,6 +91,26 @@ if "$session_tool" capture-series /mnt/data/raw/series 11 >/dev/null 2>&1; then
 fi
 if "$session_tool" capture-series /mnt/data/raw/series invalid >/dev/null 2>&1; then
 	echo "session wrapper accepted a non-numeric series count" >&2
+	exit 1
+fi
+if "$session_tool" capture-iso /mnt/data/raw/frame 0 100 \
+	>/dev/null 2>&1; then
+	echo "session wrapper accepted zero exposure" >&2
+	exit 1
+fi
+if "$session_tool" capture-iso /mnt/data/raw/frame 10000 99 \
+	>/dev/null 2>&1; then
+	echo "session wrapper accepted ISO below 100" >&2
+	exit 1
+fi
+if "$session_tool" capture-series-iso /mnt/data/raw/series 2 10000 \
+	invalid >/dev/null 2>&1; then
+	echo "session wrapper accepted a non-numeric ISO" >&2
+	exit 1
+fi
+if "$session_tool" capture-series-iso /mnt/data/raw/series 11 10000 \
+	100 >/dev/null 2>&1; then
+	echo "configured series accepted a count above the hardware bound" >&2
 	exit 1
 fi
 if "$session_tool" replay relative/script >/dev/null 2>&1; then
@@ -254,10 +282,68 @@ fi
 grep -Fq 'set -eu' "$session_tool"
 grep -Fq 'systemd-run --unit=maixcam-raw-camera' "$session_tool"
 # shellcheck disable=SC2016
-grep -Fq 'timeout 30 "$capture_camera" --ispctl raw capture "$1"' "$session_tool"
+grep -Fq 'timeout 30 "$capture_camera" --ispctl raw capture "$capture_output"' \
+	"$session_tool"
 grep -Fq 'SERIES_FRAME=%03d STATUS=PASS' "$session_tool"
+grep -Fq 'EFFECTIVE_EXPOSURE_STATE=%s' "$session_tool"
+grep -Fq 'capture-state.txt' "$session_tool"
 grep -Fq 'sleep 1' "$session_tool"
 # shellcheck disable=SC2016
 grep -Fq 'timeout 90 "$operation_binary" "$@"' "$session_tool"
 
-printf 'shell_syntax=PASS\npath_validation=PASS\nin_process_capture=PASS\nraw_unpack_contract=PASS\n'
+python3 - "$tmp_dir" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+root.joinpath("control-1.yuv").write_bytes(bytes(24))
+control_2 = bytearray(24)
+control_2[0] = 1
+root.joinpath("control-2.yuv").write_bytes(control_2)
+root.joinpath("candidate-1.yuv").write_bytes(bytes([10]) * 24)
+candidate_2 = bytearray([10] * 24)
+candidate_2[0] = 11
+root.joinpath("candidate-2.yuv").write_bytes(candidate_2)
+PY
+tolerance_args=(--width 4 --height 4 \
+	--plane-tolerance Y:0.1:1 --plane-tolerance U:0.3:1 \
+	--plane-tolerance V:0.3:1)
+python3 "$tolerance_tool" "${tolerance_args[@]}" \
+	--control "$tmp_dir/control-1.yuv" --control "$tmp_dir/control-2.yuv" \
+	--candidate "$tmp_dir/control-1.yuv" --candidate "$tmp_dir/control-2.yuv" \
+	--expect equivalent --output "$tmp_dir/equivalent.json" >/dev/null
+grep -Fq '"status": "PASS_EQUIVALENT"' "$tmp_dir/equivalent.json"
+python3 "$tolerance_tool" "${tolerance_args[@]}" \
+	--control "$tmp_dir/control-1.yuv" --control "$tmp_dir/control-2.yuv" \
+	--candidate "$tmp_dir/candidate-1.yuv" --candidate "$tmp_dir/candidate-2.yuv" \
+	--expect different --output "$tmp_dir/different.json" >/dev/null
+grep -Fq '"status": "PASS_DISTINGUISHABLE"' "$tmp_dir/different.json"
+if python3 "$tolerance_tool" --width 4 --height 4 \
+	--plane-tolerance Y:0:0 --plane-tolerance U:0:0 \
+	--plane-tolerance V:0:0 \
+	--control "$tmp_dir/control-1.yuv" --control "$tmp_dir/control-2.yuv" \
+	--candidate "$tmp_dir/control-1.yuv" --candidate "$tmp_dir/control-2.yuv" \
+	--expect equivalent --output "$tmp_dir/invalid-control.json" >/dev/null; then
+	echo "replay tolerance accepted an unstable control set" >&2
+	exit 1
+fi
+grep -Fq '"status": "INVALID_CONTROL_VARIABILITY"' \
+	"$tmp_dir/invalid-control.json"
+if python3 "$tolerance_tool" "${tolerance_args[@]}" \
+	--control "$tmp_dir/control-1.yuv" --control "$tmp_dir/control-1.yuv" \
+	--candidate "$tmp_dir/candidate-1.yuv" --candidate "$tmp_dir/candidate-2.yuv" \
+	--expect different --output "$tmp_dir/duplicate-control.json" \
+	>/dev/null 2>&1; then
+	echo "replay tolerance accepted a duplicate control path" >&2
+	exit 1
+fi
+if python3 "$tolerance_tool" "${tolerance_args[@]}" \
+	--control "$tmp_dir/control-1.yuv" --control "$tmp_dir/control-2.yuv" \
+	--candidate "$tmp_dir/candidate-1.yuv" --candidate "$tmp_dir/candidate-2.yuv" \
+	--expect different --output "$tmp_dir/control-1.yuv" \
+	>/dev/null 2>&1; then
+	echo "replay tolerance accepted an input path as output" >&2
+	exit 1
+fi
+
+printf 'shell_syntax=PASS\npath_validation=PASS\nin_process_capture=PASS\nraw_unpack_contract=PASS\nreplay_tolerance=PASS\n'

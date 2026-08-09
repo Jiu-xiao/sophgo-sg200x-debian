@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Validate repeated planar YUV420 replay sets against explicit tolerances."""
+
+import argparse
+import hashlib
+import itertools
+import json
+import sys
+from pathlib import Path
+
+
+PLANE_NAMES = ("Y", "U", "V")
+
+
+def parse_tolerance(text: str) -> tuple[str, dict[str, float | int]]:
+    parts = text.split(":")
+    if len(parts) != 3 or parts[0] not in PLANE_NAMES:
+        raise argparse.ArgumentTypeError(
+            "plane tolerance must be PLANE:MAX_CHANGED_FRACTION:MAX_ABS"
+        )
+    try:
+        changed_fraction = float(parts[1])
+        max_abs = int(parts[2])
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    if not 0.0 <= changed_fraction <= 1.0 or not 0 <= max_abs <= 255:
+        raise argparse.ArgumentTypeError("plane tolerance is outside its valid range")
+    return parts[0], {
+        "max_changed_fraction": changed_fraction,
+        "max_abs_difference": max_abs,
+    }
+
+
+def load_frame(path: Path, width: int, height: int) -> dict:
+    payload = path.read_bytes()
+    y_size = width * height
+    chroma_size = y_size // 4
+    expected_size = y_size + 2 * chroma_size
+    if len(payload) != expected_size:
+        raise ValueError(f"{path}: expected {expected_size} bytes, got {len(payload)}")
+    return {
+        "path": str(path.resolve()),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "planes": {
+            "Y": payload[:y_size],
+            "U": payload[y_size : y_size + chroma_size],
+            "V": payload[y_size + chroma_size :],
+        },
+    }
+
+
+def plane_difference(left: bytes, right: bytes) -> dict[str, float | int]:
+    changed_count = 0
+    absolute_sum = 0
+    max_abs = 0
+    for left_value, right_value in zip(left, right, strict=True):
+        absolute = abs(right_value - left_value)
+        if absolute:
+            changed_count += 1
+            absolute_sum += absolute
+            max_abs = max(max_abs, absolute)
+    return {
+        "sample_count": len(left),
+        "changed_count": changed_count,
+        "changed_fraction": changed_count / len(left),
+        "mean_absolute_difference": absolute_sum / len(left),
+        "max_abs_difference": max_abs,
+    }
+
+
+def within_tolerance(metrics: dict, tolerance: dict) -> bool:
+    return (
+        metrics["changed_fraction"] <= tolerance["max_changed_fraction"]
+        and metrics["max_abs_difference"] <= tolerance["max_abs_difference"]
+    )
+
+
+def compare_pair(left: dict, right: dict, tolerances: dict) -> dict:
+    planes = {}
+    for name in PLANE_NAMES:
+        metrics = plane_difference(left["planes"][name], right["planes"][name])
+        metrics["within_tolerance"] = within_tolerance(metrics, tolerances[name])
+        planes[name] = metrics
+    return {
+        "left_sha256": left["sha256"],
+        "right_sha256": right["sha256"],
+        "all_planes_within_tolerance": all(
+            planes[name]["within_tolerance"] for name in PLANE_NAMES
+        ),
+        "any_plane_beyond_tolerance": any(
+            not planes[name]["within_tolerance"] for name in PLANE_NAMES
+        ),
+        "planes": planes,
+    }
+
+
+def pairwise(frames: list[dict], tolerances: dict) -> list[dict]:
+    return [
+        compare_pair(left, right, tolerances)
+        for left, right in itertools.combinations(frames, 2)
+    ]
+
+
+def require_distinct_paths(paths: list[Path], label: str) -> None:
+    resolved = [path.resolve() for path in paths]
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(f"{label} runs must use distinct paths")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--control", action="append", required=True, type=Path)
+    parser.add_argument("--candidate", action="append", required=True, type=Path)
+    parser.add_argument("--plane-tolerance", action="append", required=True)
+    parser.add_argument("--expect", choices=("equivalent", "different"), required=True)
+    parser.add_argument("--width", type=int, default=640)
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+
+    if len(args.control) < 2 or len(args.candidate) < 2:
+        parser.error("control and candidate each require at least two repeated runs")
+    if args.width <= 0 or args.height <= 0 or args.width % 2 or args.height % 2:
+        parser.error("width and height must be positive even integers")
+    try:
+        require_distinct_paths(args.control, "control")
+        require_distinct_paths(args.candidate, "candidate")
+        input_paths = {path.resolve() for path in args.control + args.candidate}
+        if args.output.resolve() in input_paths:
+            raise ValueError("output path must differ from every input path")
+    except ValueError as error:
+        parser.error(str(error))
+    tolerances = {}
+    for text in args.plane_tolerance:
+        name, tolerance = parse_tolerance(text)
+        if name in tolerances:
+            parser.error(f"duplicate tolerance for plane {name}")
+        tolerances[name] = tolerance
+    if set(tolerances) != set(PLANE_NAMES):
+        parser.error("exactly one tolerance is required for each of Y, U, and V")
+
+    try:
+        controls = [load_frame(path, args.width, args.height) for path in args.control]
+        candidates = [
+            load_frame(path, args.width, args.height) for path in args.candidate
+        ]
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+
+    control_pairs = pairwise(controls, tolerances)
+    candidate_pairs = pairwise(candidates, tolerances)
+    cross_pairs = [
+        compare_pair(control, candidate, tolerances)
+        for control in controls
+        for candidate in candidates
+    ]
+    control_stable = all(
+        pair["all_planes_within_tolerance"] for pair in control_pairs
+    )
+    candidate_stable = all(
+        pair["all_planes_within_tolerance"] for pair in candidate_pairs
+    )
+    all_cross_equivalent = all(
+        pair["all_planes_within_tolerance"] for pair in cross_pairs
+    )
+    all_cross_different = all(
+        pair["any_plane_beyond_tolerance"] for pair in cross_pairs
+    )
+
+    if not control_stable:
+        status = "INVALID_CONTROL_VARIABILITY"
+    elif not candidate_stable:
+        status = "INVALID_CANDIDATE_VARIABILITY"
+    elif args.expect == "equivalent" and all_cross_equivalent:
+        status = "PASS_EQUIVALENT"
+    elif args.expect == "different" and all_cross_different:
+        status = "PASS_DISTINGUISHABLE"
+    else:
+        status = "FAIL_EXPECTATION"
+
+    summary = {
+        "status": status,
+        "expectation": args.expect,
+        "geometry": {"width": args.width, "height": args.height},
+        "format": "planar-yuv420",
+        "tolerances": tolerances,
+        "control": {
+            "runs": [{"path": item["path"], "sha256": item["sha256"]} for item in controls],
+            "stable": control_stable,
+            "pairwise": control_pairs,
+        },
+        "candidate": {
+            "runs": [{"path": item["path"], "sha256": item["sha256"]} for item in candidates],
+            "stable": candidate_stable,
+            "pairwise": candidate_pairs,
+        },
+        "cross": {
+            "all_equivalent": all_cross_equivalent,
+            "all_distinguishable": all_cross_different,
+            "pairwise": cross_pairs,
+        },
+        "interpretation_boundary": (
+            "PASS_DISTINGUISHABLE proves a repeatable output delta, not image-quality improvement."
+        ),
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(summary, indent=2) + "\n", encoding="ascii")
+    print(json.dumps({"status": status}, separators=(",", ":")))
+    return 0 if status.startswith("PASS_") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

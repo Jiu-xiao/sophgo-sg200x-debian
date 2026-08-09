@@ -18,6 +18,8 @@ usage()
 Usage:
   sc035hgs-raw-session capture EMPTY_OUTPUT_DIR
   sc035hgs-raw-session capture-series EMPTY_OUTPUT_ROOT COUNT
+  sc035hgs-raw-session capture-iso EMPTY_OUTPUT_DIR EXPOSURE_US ISO
+  sc035hgs-raw-session capture-series-iso EMPTY_OUTPUT_ROOT COUNT EXPOSURE_US ISO
   sc035hgs-raw-session replay SCRIPT_FILE
 EOF
 }
@@ -44,6 +46,19 @@ validate_capture_path()
 		/mnt/data/raw|/mnt/data/raw/*) ;;
 		*) fail "capture path must be under /mnt/data/raw: $1" ;;
 	esac
+}
+
+validate_uint()
+{
+	name=$1
+	value=$2
+	minimum=$3
+	maximum=$4
+	case $value in
+		*[!0-9]*|'') fail "$name must be an integer from $minimum to $maximum" ;;
+	esac
+	[ "$value" -ge "$minimum" ] && [ "$value" -le "$maximum" ] ||
+		fail "$name must be an integer from $minimum to $maximum"
 }
 
 validate_replay_script()
@@ -75,25 +90,58 @@ fi
 [ "$#" -ge 1 ] || { usage >&2; exit 2; }
 operation=$1
 shift
+capture_mode=
+capture_output=
+capture_count=
+capture_exposure_us=10000
+capture_iso=100
+capture_again=1024
+capture_dgain=1024
+capture_ispdgain=1024
+capture_explicit_gains=1
 
 case $operation in
 	capture)
 		[ "$#" -eq 1 ] || { usage >&2; exit 2; }
 		validate_capture_path "$1"
+		capture_mode=single
+		capture_output=$1
 		operation_binary=$capture_camera
 		;;
 	capture-series)
 		[ "$#" -eq 2 ] || { usage >&2; exit 2; }
 		validate_capture_path "$1"
-		case $2 in
-			*[!0-9]*|'')
-				fail "count must be an integer from 2 to $max_series_frames"
-				;;
-		esac
-		[ "$2" -ge 2 ] && [ "$2" -le "$max_series_frames" ] ||
-			fail "count must be an integer from 2 to $max_series_frames"
+		validate_uint count "$2" 2 "$max_series_frames"
+		capture_mode=series
+		capture_output=$1
+		capture_count=$2
 		operation_binary=$capture_camera
-		series_count=$2
+		;;
+	capture-iso)
+		[ "$#" -eq 3 ] || { usage >&2; exit 2; }
+		validate_capture_path "$1"
+		validate_uint exposure_us "$2" 1 33000
+		validate_uint iso "$3" 100 2147483647
+		capture_mode=single
+		capture_output=$1
+		capture_exposure_us=$2
+		capture_iso=$3
+		capture_explicit_gains=0
+		operation_binary=$capture_camera
+		;;
+	capture-series-iso)
+		[ "$#" -eq 4 ] || { usage >&2; exit 2; }
+		validate_capture_path "$1"
+		validate_uint count "$2" 2 "$max_series_frames"
+		validate_uint exposure_us "$3" 1 33000
+		validate_uint iso "$4" 100 2147483647
+		capture_mode=series
+		capture_output=$1
+		capture_count=$2
+		capture_exposure_us=$3
+		capture_iso=$4
+		capture_explicit_gains=0
+		operation_binary=$capture_camera
 		;;
 	replay)
 		[ "$#" -eq 1 ] || { usage >&2; exit 2; }
@@ -202,11 +250,12 @@ while pgrep -x test_mmf >/dev/null 2>&1; do
 done
 sleep 2
 
-if [ "$operation" = capture ] || [ "$operation" = capture-series ]; then
-	if [ "$operation" = capture-series ]; then
-		[ ! -e "$1" ] || fail "series output already exists: $1"
+if [ -n "$capture_mode" ]; then
+	if [ "$capture_mode" = series ]; then
+		[ ! -e "$capture_output" ] ||
+			fail "series output already exists: $capture_output"
 	fi
-	mkdir -p "$1"
+	mkdir -p "$capture_output"
 	systemd-run --unit=maixcam-raw-camera \
 		--property=Type=simple \
 		--property=Restart=no \
@@ -230,20 +279,49 @@ if [ "$operation" = capture ] || [ "$operation" = capture-series ]; then
 		sleep 1
 	done
 	[ "$ready" -eq 1 ] || fail "development camera did not become ready"
-	"$capture_camera" --ispctl manual 10000 100 >/dev/null
-	"$capture_camera" --ispctl gains 1024 1024 1024 >/dev/null
+	"$capture_camera" --ispctl manual "$capture_exposure_us" \
+		"$capture_iso" >/dev/null
+	if [ "$capture_explicit_gains" -eq 1 ]; then
+		"$capture_camera" --ispctl gains "$capture_again" "$capture_dgain" \
+			"$capture_ispdgain" >/dev/null
+	fi
 	sleep 1
 	isp_state=$("$capture_camera" --ispctl get)
-	case $isp_state in
-		'OK mode=manual gain_mode=gain exptime_us=10000 iso=100 again=1024 dgain=1024 ispdgain=1024') ;;
-		*) fail "fixed exposure did not settle: $isp_state" ;;
+	# shellcheck disable=SC2086 # Split the fixed eight-field status contract.
+	set -- $isp_state
+	[ "$#" -eq 8 ] || fail "unexpected exposure state: $isp_state"
+	[ "$1" = OK ] && [ "$2" = mode=manual ] &&
+		[ "$4" = "exptime_us=$capture_exposure_us" ] ||
+		fail "requested exposure did not settle: $isp_state"
+	effective_iso=${5#iso=}
+	case $effective_iso in
+		*[!0-9]*|'') fail "invalid effective ISO state: $isp_state" ;;
 	esac
-	if [ "$operation" = capture ]; then
-		timeout 30 "$capture_camera" --ispctl raw capture "$1"
+	if [ "$capture_explicit_gains" -eq 1 ]; then
+		[ "$3" = gain_mode=gain ] &&
+			[ "$effective_iso" -eq "$capture_iso" ] &&
+			[ "$6" = "again=$capture_again" ] &&
+			[ "$7" = "dgain=$capture_dgain" ] &&
+			[ "$8" = "ispdgain=$capture_ispdgain" ] ||
+			fail "fixed exposure and gains did not settle: $isp_state"
 	else
-		series_root=$1
+		[ "$3" = gain_mode=iso ] &&
+			[ "$effective_iso" -eq "$capture_iso" ] ||
+			fail "requested ISO did not settle: $isp_state"
+		for gain_state in "$6" "$7" "$8"; do
+			gain_value=${gain_state#*=}
+			case $gain_value in
+				*[!0-9]*|'') fail "invalid effective gain state: $isp_state" ;;
+			esac
+		done
+	fi
+	printf 'EFFECTIVE_EXPOSURE_STATE=%s\n' "$isp_state"
+	if [ "$capture_mode" = single ]; then
+		timeout 30 "$capture_camera" --ispctl raw capture "$capture_output"
+	else
+		series_root=$capture_output
 		series_index=1
-		while [ "$series_index" -le "$series_count" ]; do
+		while [ "$series_index" -le "$capture_count" ]; do
 			series_output=$(printf '%s/frame-%03d' "$series_root" "$series_index")
 			mkdir "$series_output"
 			timeout 30 "$capture_camera" --ispctl raw capture "$series_output"
@@ -252,6 +330,7 @@ if [ "$operation" = capture ] || [ "$operation" = capture-series ]; then
 			sleep 1
 		done
 	fi
+	printf '%s\n' "$isp_state" >"$capture_output/capture-state.txt"
 	operation_status=0
 	true
 	# The EXIT trap stops this development camera and restores the product service.

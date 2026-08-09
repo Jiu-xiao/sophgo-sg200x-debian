@@ -25,7 +25,8 @@ install: build
 	@install -m 0755 "$(OUTPUT_DIR)/sc035hgs-test_mmf-raw" \
 		"$(OUTPUT_DIR)/sc035hgs-raw-replay" \
 		"$(OUTPUT_DIR)/sc035hgs-raw-unpack" \
-		"$(OUTPUT_DIR)/sc035hgs-raw-session" "$(DESTDIR)/usr/bin/"
+		"$(OUTPUT_DIR)/sc035hgs-raw-session" \
+		"$(OUTPUT_DIR)/sc035hgs-replay-tolerance" "$(DESTDIR)/usr/bin/"
 
 clean:
 	@test -n "$(OUTPUT_DIR)" && test "$(OUTPUT_DIR)" != "/"

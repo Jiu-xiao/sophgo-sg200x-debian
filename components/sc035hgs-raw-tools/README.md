@@ -65,6 +65,24 @@ wrapper applies fixed exposure and gains once, waits one second between dumps,
 and restores the product camera only after the series finishes or fails. This
 avoids mixing camera-process restarts into temporal statistics.
 
+For ISO-dependent calibration, use the parameterized variants:
+
+```sh
+./sc035hgs-raw-session capture-iso \
+  /mnt/data/raw/iso-guard-001 10000 200
+./sc035hgs-raw-session capture-series-iso \
+  /mnt/data/raw/iso-series-001 3 10000 200
+```
+
+Arguments after the output/count are exposure time in microseconds and ISO.
+The wrapper rejects values outside the middleware control contract, requires
+exact exposure/ISO readback, records the complete effective state (including
+the ISP-selected analog, sensor-digital, and ISP-digital gains) in
+`capture-state.txt`, and restores the same accepted product runtime as the
+fixed-condition commands. This path characterizes the gain allocation used by
+the product AE library; it does not claim independent control of those three
+gain stages.
+
 ## Decode
 
 The captured `640x480` payload is vendor-compressed data, not generic packed
@@ -136,3 +154,26 @@ Run it with:
 Vendor MD5 mode disables TNR and DRC tone-curve smoothing. It is suitable for
 deterministic RAW parsing and ISP regression, but its results are not evidence
 for TNR tuning.
+
+## Replay tolerance
+
+Exact replay YUV hashes are timing-sensitive. Compare at least two repeated
+control runs and two repeated candidate runs, each supplied through a distinct
+path within its set, with explicit per-plane limits:
+
+```sh
+sc035hgs-replay-tolerance \
+  --control control-1.yuv --control control-2.yuv \
+  --candidate candidate-1.yuv --candidate candidate-2.yuv \
+  --plane-tolerance Y:0.002:2 \
+  --plane-tolerance U:0.002:2 \
+  --plane-tolerance V:0.002:2 \
+  --expect different --output replay-comparison.json
+```
+
+Each tolerance is `plane:max_changed_fraction:max_absolute_difference`. Both
+sets must first be internally stable. `--expect equivalent` is for unchanged
+regression output; `--expect different` requires every control/candidate pair
+to exceed the noise tolerance in at least one plane. A distinguishable result
+only establishes a repeatable delta and is not evidence that image quality
+improved.
