@@ -1,6 +1,11 @@
 [CmdletBinding()]
 param(
+    [ValidateSet('rtsp', 'y8')]
+    [string]$Mode = 'rtsp',
     [string]$Url = 'rtsp://10.42.0.1:8554/live',
+    [string]$Y8Host = '10.42.0.1',
+    [ValidateRange(1, 65535)]
+    [int]$Y8Port = 8555,
     [switch]$RefreshDependencies,
     [switch]$SetupOnly
 )
@@ -10,7 +15,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $toolDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $requirements = Join-Path $toolDirectory 'requirements.txt'
-$viewer = Join-Path $toolDirectory 'viewer.py'
+$viewer = if ($Mode -eq 'y8') {
+    Join-Path $toolDirectory 'y8_viewer.py'
+} else {
+    Join-Path $toolDirectory 'viewer.py'
+}
 $basePython = (Get-Command python -ErrorAction Stop).Source
 $runtimeRoot = Join-Path $env:LOCALAPPDATA 'MaixCAM\camera-viewer'
 $virtualEnvironment = Join-Path $runtimeRoot 'venv'
@@ -50,5 +59,9 @@ if ($SetupOnly) {
     exit 0
 }
 
-& $venvPython $viewer --url $Url
+if ($Mode -eq 'y8') {
+    & $venvPython $viewer --host $Y8Host --port $Y8Port
+} else {
+    & $venvPython $viewer --url $Url
+}
 exit $LASTEXITCODE

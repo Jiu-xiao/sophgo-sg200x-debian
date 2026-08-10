@@ -36,6 +36,19 @@ class CameraToolTests(unittest.TestCase):
             ["av==18.0.0", "opencv-python==4.13.0.92"],
         )
 
+    def test_y8_tools_are_valid_python(self) -> None:
+        for name in (
+            "rtsp_benchmark.py",
+            "y8_protocol.py",
+            "y8_viewer.py",
+            "y8_benchmark.py",
+        ):
+            source = (VIEWER_ROOT / name).read_text(encoding="utf-8")
+            ast.parse(source)
+
+        y8_viewer = (VIEWER_ROOT / "y8_viewer.py").read_text(encoding="utf-8")
+        self.assertIn(").copy()", y8_viewer)
+
 
 if __name__ == "__main__":
     unittest.main()

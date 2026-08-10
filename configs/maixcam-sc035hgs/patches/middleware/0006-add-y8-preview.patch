@@ -1,0 +1,511 @@
+diff --git a/sample/test_mmf/maix_mmf/sophgo_middleware.c b/sample/test_mmf/maix_mmf/sophgo_middleware.c
+index 959c542..ad80893 100644
+--- a/sample/test_mmf/maix_mmf/sophgo_middleware.c
++++ b/sample/test_mmf/maix_mmf/sophgo_middleware.c
+@@ -1596,14 +1596,16 @@ static int _mmf_add_vi_channel(int ch, int width, int height, int format, int fp
+ 	}
+ 
+ 	if (format != PIXEL_FORMAT_NV21
+-		&& format != PIXEL_FORMAT_RGB_888) {
++		&& format != PIXEL_FORMAT_RGB_888
++		&& format != PIXEL_FORMAT_YUV_400) {
+ 		printf("invalid format\n");
+ 		return -1;
+ 	}
+ 
+ 	if ((format == PIXEL_FORMAT_RGB_888 && width * height * 3 > 640 * 480 * 3)
+-		|| (format == PIXEL_FORMAT_NV21 && width * height * 3 / 2 > 2560 * 1440 * 3 / 2)) {
+-		printf("image size is too large, for NV21, maximum resolution 2560x1440, for RGB888, maximum resolution 640x480!\n");
++		|| (format == PIXEL_FORMAT_NV21 && width * height * 3 / 2 > 2560 * 1440 * 3 / 2)
++		|| (format == PIXEL_FORMAT_YUV_400 && width * height > 2560 * 1440)) {
++		printf("image size is too large: NV21/Y8 max 2560x1440, RGB888 max 640x480\n");
+ 		return -1;
+ 	}
+ 
+diff --git a/sample/test_mmf/sample_vio.c b/sample/test_mmf/sample_vio.c
+index 178c6cb..8eac28c 100644
+--- a/sample/test_mmf/sample_vio.c
++++ b/sample/test_mmf/sample_vio.c
+@@ -1,5 +1,6 @@
+ #include <stdint.h>
+ #include <string.h>
++#include <strings.h>
+ #include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -25,6 +26,7 @@
+ // #include "vo_uapi.h"
+ #include "rtsp_server.h"
+ #include "fomat.h"
++#include "y8_preview.h"
+ 
+ #include <stdio.h>
+ #include <stdbool.h>
+@@ -46,6 +48,35 @@
+ 
+ static int rtsp_server_type = 1;  //1, h265, 2, h264
+ 
++#define Y8_PREVIEW_DEFAULT_PORT 8555
++
++static bool y8_preview_enabled(void)
++{
++	const char *value = getenv("MAIXCAM_Y8_PREVIEW");
++
++	return value != NULL &&
++		(!strcmp(value, "1") || !strcasecmp(value, "true") ||
++		 !strcasecmp(value, "yes"));
++}
++
++static uint16_t y8_preview_port(void)
++{
++	const char *value = getenv("MAIXCAM_Y8_PORT");
++	char *end = NULL;
++	long port;
++
++	if (value == NULL || *value == '\0')
++		return Y8_PREVIEW_DEFAULT_PORT;
++	errno = 0;
++	port = strtol(value, &end, 10);
++	if (errno != 0 || *end != '\0' || port < 1 || port > UINT16_MAX) {
++		fprintf(stderr, "Invalid MAIXCAM_Y8_PORT=%s; using %d\n", value,
++			Y8_PREVIEW_DEFAULT_PORT);
++		return Y8_PREVIEW_DEFAULT_PORT;
++	}
++	return (uint16_t)port;
++}
++
+ // #define DEBUG_EN
+ #ifdef DEBUG_EN
+ #define DEBUG(fmt, args...) printf("[%s][%d]: "fmt, __func__, __LINE__, ##args)
+@@ -2418,6 +2449,8 @@ static int _test_rtsp_h26x(void)
+ static int _test_vi_venc_h26x_rtsp(void)
+ {
+ 	int isp_control_fd = -1;
++	int y8_vi_ch = -1;
++	bool y8_started = false;
+ 	int result = 0;
+ 
+ 	if (0 != rtsp_server_init(NULL, 8554)) {
+@@ -2465,6 +2498,26 @@ static int _test_vi_venc_h26x_rtsp(void)
+ 		return -1;
+ 	}
+ 
++	if (y8_preview_enabled()) {
++		y8_vi_ch = mmf_get_vi_unused_channel();
++		if (y8_vi_ch < 0 ||
++		    mmf_add_vi_channel_v2(y8_vi_ch, 640, 480,
++					  PIXEL_FORMAT_YUV_400, 30, 2,
++					  !true, !true, 0, 3) != 0) {
++			fprintf(stderr, "Y8 preview VPSS channel unavailable\n");
++			y8_vi_ch = -1;
++		} else {
++			int y8_ret = y8_preview_start(y8_vi_ch, y8_preview_port());
++			if (y8_ret != 0) {
++				fprintf(stderr, "Y8 preview start failed: %d\n", y8_ret);
++				mmf_del_vi_channel(y8_vi_ch);
++				y8_vi_ch = -1;
++			} else {
++				y8_started = true;
++			}
++		}
++	}
++
+ 	mmf_vi_set_pop_timeout(100);
+ 	isp_control_fd = maixcam_isp_control_server_open(
+ 		MAIXCAM_ISP_CONTROL_SOCKET);
+@@ -2570,6 +2623,10 @@ static int _test_vi_venc_h26x_rtsp(void)
+ 	}
+ 
+ _exit:
++	if (y8_started)
++		y8_preview_stop();
++	if (y8_vi_ch >= 0)
++		mmf_del_vi_channel(y8_vi_ch);
+ 	maixcam_isp_control_server_close(&isp_control_fd,
+ 					 MAIXCAM_ISP_CONTROL_SOCKET);
+ 	if (mmf_del_venc_channel(ch)) {
+diff --git a/sample/test_mmf/y8_preview.c b/sample/test_mmf/y8_preview.c
+new file mode 100644
+index 0000000..9f2435c
+--- /dev/null
++++ b/sample/test_mmf/y8_preview.c
+@@ -0,0 +1,364 @@
++#include "y8_preview.h"
++
++#include <arpa/inet.h>
++#include <errno.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "maix_mmf.h"
++
++#define Y8_PREVIEW_WIDTH 640
++#define Y8_PREVIEW_HEIGHT 480
++#define Y8_PREVIEW_FRAME_SIZE (Y8_PREVIEW_WIDTH * Y8_PREVIEW_HEIGHT)
++#define Y8_PREVIEW_HEADER_SIZE 40
++#define Y8_PREVIEW_FORMAT 1
++#define Y8_PREVIEW_SEND_TIMEOUT_MS 250
++
++typedef struct {
++	int vi_channel;
++	uint16_t port;
++	int listen_fd;
++	bool started;
++	bool stop;
++	pthread_t capture_thread;
++	pthread_t server_thread;
++	pthread_mutex_t lock;
++	pthread_cond_t frame_ready;
++	uint8_t *latest_frame;
++	uint8_t *send_frame;
++	uint64_t sequence;
++	uint64_t timestamp_ns;
++} y8_preview_state_t;
++
++static y8_preview_state_t state = {
++	.listen_fd = -1,
++	.lock = PTHREAD_MUTEX_INITIALIZER,
++	.frame_ready = PTHREAD_COND_INITIALIZER,
++};
++
++static uint64_t monotonic_time_ns(void)
++{
++	struct timespec now;
++
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
++}
++
++static bool stop_requested(void)
++{
++	bool stop;
++
++	pthread_mutex_lock(&state.lock);
++	stop = state.stop;
++	pthread_mutex_unlock(&state.lock);
++	return stop;
++}
++
++static void put_u16(uint8_t *dst, uint16_t value)
++{
++	dst[0] = (uint8_t)(value >> 8);
++	dst[1] = (uint8_t)value;
++}
++
++static void put_u32(uint8_t *dst, uint32_t value)
++{
++	dst[0] = (uint8_t)(value >> 24);
++	dst[1] = (uint8_t)(value >> 16);
++	dst[2] = (uint8_t)(value >> 8);
++	dst[3] = (uint8_t)value;
++}
++
++static void put_u64(uint8_t *dst, uint64_t value)
++{
++	for (int i = 0; i < 8; ++i)
++		dst[i] = (uint8_t)(value >> (56 - 8 * i));
++}
++
++static void build_header(uint8_t header[Y8_PREVIEW_HEADER_SIZE],
++			 uint64_t sequence, uint64_t timestamp_ns)
++{
++	memset(header, 0, Y8_PREVIEW_HEADER_SIZE);
++	memcpy(header, "Y8P0", 4);
++	put_u16(header + 4, 1);
++	put_u16(header + 6, Y8_PREVIEW_HEADER_SIZE);
++	put_u16(header + 8, Y8_PREVIEW_WIDTH);
++	put_u16(header + 10, Y8_PREVIEW_HEIGHT);
++	put_u16(header + 12, Y8_PREVIEW_WIDTH);
++	put_u16(header + 14, Y8_PREVIEW_FORMAT);
++	put_u64(header + 16, sequence);
++	put_u64(header + 24, timestamp_ns);
++	put_u32(header + 32, Y8_PREVIEW_FRAME_SIZE);
++}
++
++static int send_all(int fd, const uint8_t *data, size_t size)
++{
++	while (size > 0) {
++		ssize_t sent = send(fd, data, size, MSG_NOSIGNAL);
++
++		if (sent > 0) {
++			data += sent;
++			size -= (size_t)sent;
++			continue;
++		}
++		if (sent < 0 && errno == EINTR)
++			continue;
++		return -1;
++	}
++	return 0;
++}
++
++static void *capture_frames(void *arg)
++{
++	bool logged_invalid_frame = false;
++
++	(void)arg;
++
++	while (!stop_requested()) {
++		void *frame_info = NULL;
++		mmf_frame_info_t mapped = {0};
++		int ret = mmf_vi_frame_pop2(state.vi_channel, &frame_info, &mapped);
++
++		if (ret != 0)
++			continue;
++
++		VIDEO_FRAME_INFO_S *frame = (VIDEO_FRAME_INFO_S *)frame_info;
++		uint32_t stride = frame->stVFrame.u32Stride[0];
++		uint32_t plane_size = frame->stVFrame.u32Length[0];
++		bool valid = mapped.data != NULL &&
++			mapped.w == Y8_PREVIEW_WIDTH &&
++			mapped.h == Y8_PREVIEW_HEIGHT &&
++			mapped.fmt == PIXEL_FORMAT_YUV_400 &&
++			stride >= Y8_PREVIEW_WIDTH &&
++			plane_size >= stride * Y8_PREVIEW_HEIGHT;
++
++		if (valid) {
++			pthread_mutex_lock(&state.lock);
++			for (int row = 0; row < Y8_PREVIEW_HEIGHT; ++row) {
++				memcpy(state.latest_frame + row * Y8_PREVIEW_WIDTH,
++				       (uint8_t *)mapped.data + row * stride,
++				       Y8_PREVIEW_WIDTH);
++			}
++			state.sequence++;
++			state.timestamp_ns = monotonic_time_ns();
++			pthread_cond_signal(&state.frame_ready);
++			pthread_mutex_unlock(&state.lock);
++		} else if (!logged_invalid_frame) {
++			fprintf(stderr,
++				"Y8 preview rejected frame: %dx%d fmt=%d stride=%u plane=%u\n",
++				mapped.w, mapped.h, mapped.fmt, stride, plane_size);
++			logged_invalid_frame = true;
++		}
++
++		mmf_vi_frame_free2(state.vi_channel, &frame_info);
++	}
++	return NULL;
++}
++
++static int wait_for_frame(uint64_t *last_sequence, uint64_t *timestamp_ns)
++{
++	struct timespec deadline;
++
++	clock_gettime(CLOCK_REALTIME, &deadline);
++	deadline.tv_sec += 1;
++
++	pthread_mutex_lock(&state.lock);
++	while (!state.stop && state.sequence == *last_sequence) {
++		int ret = pthread_cond_timedwait(&state.frame_ready, &state.lock,
++						 &deadline);
++		if (ret == ETIMEDOUT)
++			break;
++	}
++	if (state.stop) {
++		pthread_mutex_unlock(&state.lock);
++		return -1;
++	}
++	if (state.sequence == *last_sequence) {
++		pthread_mutex_unlock(&state.lock);
++		return 0;
++	}
++
++	memcpy(state.send_frame, state.latest_frame, Y8_PREVIEW_FRAME_SIZE);
++	*last_sequence = state.sequence;
++	*timestamp_ns = state.timestamp_ns;
++	pthread_mutex_unlock(&state.lock);
++	return 1;
++}
++
++static void serve_client(int client_fd)
++{
++	struct timeval timeout = {
++		.tv_sec = 0,
++		.tv_usec = Y8_PREVIEW_SEND_TIMEOUT_MS * 1000,
++	};
++	int one = 1;
++	uint64_t last_sequence = 0;
++
++	setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
++	setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++
++	while (!stop_requested()) {
++		uint8_t header[Y8_PREVIEW_HEADER_SIZE];
++		uint64_t timestamp_ns;
++		int ready = wait_for_frame(&last_sequence, &timestamp_ns);
++
++		if (ready < 0)
++			break;
++		if (ready == 0)
++			continue;
++
++		build_header(header, last_sequence, timestamp_ns);
++		if (send_all(client_fd, header, sizeof(header)) != 0 ||
++		    send_all(client_fd, state.send_frame, Y8_PREVIEW_FRAME_SIZE) != 0)
++			break;
++	}
++}
++
++static void *serve_frames(void *arg)
++{
++	(void)arg;
++
++	while (!stop_requested()) {
++		struct pollfd poll_fd = {
++			.fd = state.listen_fd,
++			.events = POLLIN,
++		};
++		int ret = poll(&poll_fd, 1, 200);
++
++		if (ret < 0) {
++			if (errno == EINTR)
++				continue;
++			break;
++		}
++		if (ret == 0 || !(poll_fd.revents & POLLIN))
++			continue;
++
++		struct sockaddr_in peer;
++		socklen_t peer_size = sizeof(peer);
++		int client_fd = accept(state.listen_fd, (struct sockaddr *)&peer,
++				       &peer_size);
++		if (client_fd < 0)
++			continue;
++
++		printf("Y8 preview client connected: %s:%u\n",
++		       inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
++		serve_client(client_fd);
++		close(client_fd);
++		printf("Y8 preview client disconnected\n");
++	}
++	return NULL;
++}
++
++static int open_listener(uint16_t port)
++{
++	struct sockaddr_in address = {
++		.sin_family = AF_INET,
++		.sin_port = htons(port),
++		.sin_addr.s_addr = htonl(INADDR_ANY),
++	};
++	int one = 1;
++	int fd = socket(AF_INET, SOCK_STREAM, 0);
++
++	if (fd < 0)
++		return -1;
++	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++	if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
++	    listen(fd, 1) != 0) {
++		close(fd);
++		return -1;
++	}
++	return fd;
++}
++
++int y8_preview_start(int vi_channel, uint16_t port)
++{
++	int ret;
++
++	if (vi_channel < 0 || port == 0)
++		return -EINVAL;
++	if (state.started)
++		return -EBUSY;
++
++	state.latest_frame = malloc(Y8_PREVIEW_FRAME_SIZE);
++	state.send_frame = malloc(Y8_PREVIEW_FRAME_SIZE);
++	if (state.latest_frame == NULL || state.send_frame == NULL) {
++		ret = -ENOMEM;
++		goto fail;
++	}
++
++	state.listen_fd = open_listener(port);
++	if (state.listen_fd < 0) {
++		ret = -errno;
++		goto fail;
++	}
++
++	state.vi_channel = vi_channel;
++	state.port = port;
++	state.sequence = 0;
++	state.timestamp_ns = 0;
++	state.stop = false;
++	state.started = true;
++
++	ret = pthread_create(&state.capture_thread, NULL, capture_frames, NULL);
++	if (ret != 0) {
++		ret = -ret;
++		goto fail_started;
++	}
++	ret = pthread_create(&state.server_thread, NULL, serve_frames, NULL);
++	if (ret != 0) {
++		pthread_mutex_lock(&state.lock);
++		state.stop = true;
++		pthread_cond_broadcast(&state.frame_ready);
++		pthread_mutex_unlock(&state.lock);
++		pthread_join(state.capture_thread, NULL);
++		ret = -ret;
++		goto fail_started;
++	}
++
++	printf("Y8 preview listening on tcp://0.0.0.0:%u (%dx%d, %d bytes/frame)\n",
++	       port, Y8_PREVIEW_WIDTH, Y8_PREVIEW_HEIGHT, Y8_PREVIEW_FRAME_SIZE);
++	return 0;
++
++fail_started:
++	state.started = false;
++	close(state.listen_fd);
++	state.listen_fd = -1;
++fail:
++	free(state.send_frame);
++	free(state.latest_frame);
++	state.send_frame = NULL;
++	state.latest_frame = NULL;
++	return ret;
++}
++
++void y8_preview_stop(void)
++{
++	if (!state.started)
++		return;
++
++	pthread_mutex_lock(&state.lock);
++	state.stop = true;
++	pthread_cond_broadcast(&state.frame_ready);
++	pthread_mutex_unlock(&state.lock);
++	shutdown(state.listen_fd, SHUT_RDWR);
++
++	pthread_join(state.server_thread, NULL);
++	pthread_join(state.capture_thread, NULL);
++	close(state.listen_fd);
++	state.listen_fd = -1;
++	free(state.send_frame);
++	free(state.latest_frame);
++	state.send_frame = NULL;
++	state.latest_frame = NULL;
++	state.started = false;
++}
+diff --git a/sample/test_mmf/y8_preview.h b/sample/test_mmf/y8_preview.h
+new file mode 100644
+index 0000000..0dd1c35
+--- /dev/null
++++ b/sample/test_mmf/y8_preview.h
+@@ -0,0 +1,9 @@
++#ifndef MAIXCAM_Y8_PREVIEW_H
++#define MAIXCAM_Y8_PREVIEW_H
++
++#include <stdint.h>
++
++int y8_preview_start(int vi_channel, uint16_t port);
++void y8_preview_stop(void);
++
++#endif

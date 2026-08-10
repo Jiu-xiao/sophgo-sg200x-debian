@@ -15,6 +15,7 @@ MMF_SOURCE = "sample/test_mmf/maix_mmf/sophgo_middleware.c"
 SAMPLE_VIO_SOURCE = "sample/test_mmf/sample_vio.c"
 SAMPLE_VIO_MAIN_SOURCE = "sample/test_mmf/sample_vio_main.c"
 ISP_CONTROL_SOURCE = "sample/test_mmf/isp_control.c"
+Y8_PREVIEW_SOURCE = "sample/test_mmf/y8_preview.c"
 HGS_VB_PATCH = (
     CONFIG_ROOT
     / "maixcam-sc035hgs/patches/middleware/0002-increase-h26x-vb-pool.patch"
@@ -30,6 +31,10 @@ HGS_ISP_CONTROL_PATCH = (
 HGS_NOISE_CONTROL_PATCH = (
     CONFIG_ROOT
     / "maixcam-sc035hgs/patches/middleware/0005-add-runtime-noise-control.patch"
+)
+HGS_Y8_PREVIEW_PATCH = (
+    CONFIG_ROOT
+    / "maixcam-sc035hgs/patches/middleware/0006-add-y8-preview.patch"
 )
 MAIXCAM_SIGPIPE_PATCH = (
     CONFIG_ROOT
@@ -135,6 +140,18 @@ class MiddlewarePatchTests(unittest.TestCase):
                 f"unexpected HGS noise control patch selection for {board}",
             )
 
+    def test_hgs_y8_preview_patch_is_isolated_to_hgs_matrix_entry(self) -> None:
+        for entry in plan.load_matrix(CONFIG_ROOT):
+            board = str(entry["board"])
+            selected = HGS_Y8_PREVIEW_PATCH in plan.patch_files(
+                CONFIG_ROOT, board, "middleware"
+            )
+            self.assertEqual(
+                selected,
+                "maixcam-sc035hgs" in plan.board_chain(CONFIG_ROOT, board),
+                f"unexpected HGS Y8 preview patch selection for {board}",
+            )
+
     def test_hgs_fps_contract_uses_effective_input_rate(self) -> None:
         patch_text = HGS_FPS_PATCH.read_text(encoding="utf-8")
         self.assertRegex(
@@ -230,6 +247,30 @@ class MiddlewarePatchTests(unittest.TestCase):
         )
         self.assertIn('attr.stAuto.TnrStrength0[iso_index]', source)
         self.assertIn('attr.stAuto.GlobalGain[iso_index]', source)
+
+    def test_hgs_y8_preview_latest_frame_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            vio_source = materialize_source(
+                "maixcam-sc035hgs", SAMPLE_VIO_SOURCE, root
+            )
+            preview_source = materialize_source(
+                "maixcam-sc035hgs", Y8_PREVIEW_SOURCE, root
+            )
+            mmf_source = materialize_source(
+                "maixcam-sc035hgs", MMF_SOURCE, root
+            )
+
+        self.assertIn('getenv("MAIXCAM_Y8_PREVIEW")', vio_source)
+        self.assertEqual(vio_source.count("y8_preview_start("), 1)
+        self.assertEqual(vio_source.count("y8_preview_stop();"), 1)
+        self.assertIn("PIXEL_FORMAT_YUV_400, 30, 2", vio_source)
+        self.assertIn("#define Y8_PREVIEW_FRAME_SIZE", preview_source)
+        self.assertIn("mmf_vi_frame_free2(state.vi_channel", preview_source)
+        self.assertIn("memcpy(state.send_frame, state.latest_frame", preview_source)
+        self.assertNotIn("realloc(", preview_source)
+        self.assertIn("format != PIXEL_FORMAT_YUV_400", mmf_source)
+        self.assertIn("format == PIXEL_FORMAT_YUV_400", mmf_source)
 
 
 if __name__ == "__main__":
